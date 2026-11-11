@@ -119,16 +119,23 @@ export function touchedFields(p: EvolutionRolePatch, role: Role): PatchedField[]
 }
 
 const TIER_NAMES: readonly string[] = MODEL_TIERS
+const CLAUDE_ALIAS_FOR_TIER: Record<ModelTier, string> = {
+  top: 'fable',
+  deep: 'opus',
+  everyday: 'sonnet',
+  fast: 'haiku'
+}
 
 /**
- * The model a role should hold after a tier change, or undefined to leave it. Only a role whose model IS a tier name or a tier alias (opus, sonnet...)
- * follows the tier (a concrete model id is the user's pick and the engine cannot map a tier to one without the
- * connection's catalog; staffing resolves the model from the tier at spawn time).
+ * The model a role should hold after a tier change, or undefined to leave it. A bare tier name stays a tier name; a
+ * Claude tier alias (fable, opus, sonnet, haiku, opusplan) maps to the target tier's Claude alias so `adapterForProject`
+ * keeps the role in the Claude model family and the Claude SDK receives a valid alias. Concrete model ids stay untouched.
  */
 export function nextModelFor(role: Pick<Role, 'model'>, tier: ModelTier): string | undefined {
   const m = typeof role.model === 'string' ? role.model.trim().toLowerCase() : ''
-  const named = TIER_NAMES.includes(m) ? (m as ModelTier) : settingTier(m)
-  return named !== undefined && named !== tier ? tier : undefined
+  if (TIER_NAMES.includes(m)) return m !== tier ? tier : undefined
+  const aliasTier = settingTier(m)
+  return aliasTier !== undefined && aliasTier !== tier ? CLAUDE_ALIAS_FOR_TIER[tier] : undefined
 }
 
 /**

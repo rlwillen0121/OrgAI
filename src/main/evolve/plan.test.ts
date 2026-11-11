@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { adapterForProject, defaultRoles } from '../../shared/defaults'
 import { project, role } from './fixtures'
 import { applyPlan, effectiveConcurrency, nextModelFor, patchFingerprint, planFingerprint, planSummary, stepEffort, stepTier, touchedFields } from './plan'
 
@@ -24,12 +25,27 @@ describe('plan helpers', () => {
     expect(out.maxConcurrentSubagents).toBe(5)
     expect(out.roles.find((r) => r.slug === 'lead')).toBe(p.roles[0])
   })
-  it('tier changes move the model only when it names a tier or alias', () => {
+  it('tier changes move the model only when it names a tier or alias, preserving Claude aliases for adapterForProject', () => {
     expect(nextModelFor({ model: 'deep' }, 'fast')).toBe('fast')
-    expect(nextModelFor({ model: 'opus' }, 'fast')).toBe('fast')
+    expect(nextModelFor({ model: 'opus' }, 'fast')).toBe('haiku')
+    expect(nextModelFor({ model: 'opus' }, 'everyday')).toBe('sonnet')
+    expect(nextModelFor({ model: 'sonnet' }, 'deep')).toBe('opus')
     expect(nextModelFor({ model: 'claude-x-9' }, 'fast')).toBeUndefined()
     expect(nextModelFor({ model: 'deep' }, 'deep')).toBeUndefined()
+    expect(nextModelFor({ model: 'opus' }, 'deep')).toBeUndefined()
     expect(touchedFields({ slug: 'dev', tier: 'fast', reason: '' }, role('dev', { model: 'deep' }))).toEqual(['tier', 'model'])
+
+    const realClaude = project({ provider: { id: 'claude', connection: 'anthropic', auth: { kind: 'subscription' } } as never }, defaultRoles())
+    const evolved = applyPlan(realClaude, {
+      rolePatches: [
+        { slug: 'implementer', tier: 'everyday', reason: '' },
+        { slug: 'researcher', tier: 'fast', reason: '' }
+      ],
+      maxConcurrentSubagents: undefined
+    })
+    expect(adapterForProject(evolved, []).mismatched).toEqual([])
+    expect(evolved.roles.find((r) => r.slug === 'implementer')?.model).toBe('sonnet')
+    expect(evolved.roles.find((r) => r.slug === 'researcher')?.model).toBe('haiku')
   })
   it('steps and summaries', () => {
     expect(stepTier('deep', -1)).toBe('everyday')
