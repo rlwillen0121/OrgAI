@@ -63,19 +63,42 @@ export function isNetworkPath(p: string): boolean {
  * ancestor with the rest re-appended (macOS `/var/...` becomes `/private/var/...` for a not-yet-created data dir).
  * The resolved input when no ancestor can be resolved.
  */
-export function canonicalDeep(p: string): string {
+export function canonicalDeep(p: string, memo?: CanonicalMemo): string {
   let probe = resolve(p)
   if (isNetworkPath(probe)) return probe
+  const exists = (q: string): boolean => {
+    const known = memo?.exists.get(q)
+    if (known !== undefined) return known
+    const v = existsSync(q)
+    memo?.exists.set(q, v)
+    return v
+  }
+  const canon = (q: string): string => {
+    const known = memo?.canonical.get(q)
+    if (known !== undefined) return known
+    const v = canonical(q)
+    memo?.canonical.set(q, v)
+    return v
+  }
 
   const rest: string[] = []
   for (let i = 0; i < 256; i++) {
-    if (existsSync(probe)) break
+    if (exists(probe)) break
     const parent = resolve(probe, '..')
     if (parent === probe) break
     rest.unshift(basename(probe))
     probe = parent
   }
-  return rest.length ? join(canonical(probe), ...rest) : canonical(probe)
+  return rest.length ? join(canon(probe), ...rest) : canon(probe)
+}
+
+/**
+ * File system answers remembered for ONE scan (a caller creates it per command and drops it afterwards; never keep one
+ * across calls: links and files can change between commands).
+ */
+export interface CanonicalMemo {
+  exists: Map<string, boolean>
+  canonical: Map<string, string>
 }
 
 /** The lexical and the canonical spelling of a path (one entry when they agree). */

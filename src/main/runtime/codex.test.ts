@@ -579,8 +579,18 @@ describe('CodexAdapter session', () => {
     expect(toolNames).toEqual(expect.arrayContaining(['set_plan', 'orgai_update_plan', 'ask_user', 'spawn_report', 'message_agent', 'list_team']))
     expect(toolNames).not.toContain('update_plan')
     expect(s.turnStarts('th-1')[0].params.input).toEqual([{ type: 'text', text: 'Build the thing', text_elements: [] }])
+    // A work-run root with no effort of its own starts on the same default as Claude's (medium).
+    expect(s.turnStarts('th-1')[0].params.effort).toBe('medium')
     expect(ctx.events).toContainEqual({ type: 'run.status', runId: 'run-1', status: 'running', sessionId: 'th-1' })
     expect(lastAgent(ctx, 'root')).toMatchObject({ roleSlug: 'lead', model: 'gpt-test', state: 'thinking' })
+  })
+
+  it('keeps a root role effort Codex takes instead of the medium default', async () => {
+    const { adapter, servers } = setup()
+    const ctx = ctxFor({ roles: [role({ id: 'lead', slug: 'lead', effort: 'high' })], autoContinue: false })
+    session = await adapter.start(ctx)
+    await vi.waitFor(() => expect(servers[0].turnStarts('th-1')).toHaveLength(1))
+    expect(servers[0].turnStarts('th-1')[0].params.effort).toBe('high')
   })
 
   it('a Codex version warning from the app-server becomes one run warning per session (cli-standalone 6.2)', async () => {
@@ -638,8 +648,8 @@ describe('CodexAdapter session', () => {
     const childStart = s.of('thread/start')[1].params
     expect(childStart.developerInstructions).toContain('You are engineer.')
     expect(childStart.sandbox).toBe('workspace-write')
-    // A report without reports of its own gets only the every-agent tools (request_permission_rules, produce_output, register_output, read_output, list_skills, load_skill).
-    expect((childStart.dynamicTools as { name: string }[]).map((t) => t.name)).toEqual(['request_permission_rules', 'produce_output', 'register_output', 'read_output', 'list_skills', 'load_skill', 'app_reference'])
+    // A report without reports of its own gets only the every-agent tools: request_permission_rules (outputs belong to the root on a code project, app_reference to roles that spawn, skill tools to runs with skills).
+    expect((childStart.dynamicTools as { name: string }[]).map((t) => t.name)).toEqual(['request_permission_rules'])
     expect(s.turnStarts('th-2')[0].params.input[0].text).toContain('Build the login form')
     const childId = ctx.events.find((e): e is Extract<RunEvent, { type: 'agent.upsert' }> => e.type === 'agent.upsert' && e.agent.handle === 'engineer-1')!.agent.id
     expect(lastAgent(ctx, childId)).toMatchObject({ handle: 'engineer-1', parentId: 'root', spawnToolUseId: 'c-spawn', roleSlug: 'engineer' })
@@ -2809,12 +2819,20 @@ describe('CodexAdapter skills', () => {
     expect(ctx.events.some((e) => e.type === 'skill.used')).toBe(false)
   })
 
-  it('has the skill tools even without skills at start (they read ctx.skills() at call time)', async () => {
+  it('has the skill tools only when the run has skills at start', async () => {
     const { adapter, servers } = setup()
     session = await adapter.start(fakeCtx({ project: project({ path: dir, isolateWriters: false }), continuationDelayMs: 5 }))
     const s = servers[0]
     await vi.waitFor(() => expect(s.turnStarts('th-1')).toHaveLength(1))
-    expect(s.of('thread/start')[0].params.dynamicTools.map((t: { name: string }) => t.name)).toEqual(expect.arrayContaining(['list_skills', 'load_skill']))
+    const none = s.of('thread/start')[0].params.dynamicTools.map((t: { name: string }) => t.name)
+    expect(none).not.toContain('list_skills')
+    expect(none).not.toContain('load_skill')
+    const second = setup()
+    const skill = { id: 'sk', name: 'alpha', description: 'd', dir: '/nowhere', files: [], roleIds: ['r-lead'] }
+    const withSkills = await second.adapter.start(fakeCtx({ project: project({ path: dir, isolateWriters: false }), continuationDelayMs: 5, skills: () => [skill] }))
+    await vi.waitFor(() => expect(second.servers[0].turnStarts('th-1')).toHaveLength(1))
+    expect(second.servers[0].of('thread/start')[0].params.dynamicTools.map((t: { name: string }) => t.name)).toEqual(expect.arrayContaining(['list_skills', 'load_skill']))
+    await withSkills.stop()
   })
 
   it('switches off Codex native skills for the thread cwd before it starts, and launches with bundled skills off', async () => {

@@ -83,10 +83,27 @@ describe('team files over the socket (invokeRpc)', () => {
     await expect(rpc(IPC.projectsCreate, { name: 'E', path: repo, brief: '', kind: 'engagement', teamFiles: { digest: 'ab'.repeat(32) } })).rejects.toThrow(/code projects only/)
   })
 
-  it('projects:setFolderConfigTrust and the teamFiles decisions are refused over the socket as desktop-only', async () => {
+  const DECISIONS = [IPC.projectsSetFolderConfigTrust, TEAM_FILES_IPC.teamFilesApprove, TEAM_FILES_IPC.teamFilesReject, TEAM_FILES_IPC.teamFilesUndo, TEAM_FILES_IPC.teamFilesEnable, TEAM_FILES_IPC.teamFilesCommit]
+
+  it('projects:setFolderConfigTrust and the teamFiles decisions are refused to a socket client, whatever scopes it holds (SECURITY)', async () => {
     const { rpc } = setup()
-    for (const ch of [IPC.projectsSetFolderConfigTrust, TEAM_FILES_IPC.teamFilesApprove, TEAM_FILES_IPC.teamFilesReject, TEAM_FILES_IPC.teamFilesUndo, TEAM_FILES_IPC.teamFilesEnable, TEAM_FILES_IPC.teamFilesCommit]) {
-      await expect(rpc(ch, { projectId: 'proj_x', digest: 'ab'.repeat(32), trust: true }), ch).rejects.toMatchObject({ code: 'desktop_unavailable' })
+    for (const ch of DECISIONS) {
+      await expect(rpc(ch, { projectId: 'proj_x', digest: 'ab'.repeat(32), trust: true }), ch).rejects.toMatchObject({ code: 'scope_denied' })
+    }
+  })
+
+  it('they need the configure scope at the gate, even for the in-process client', async () => {
+    const { dispatcher } = setup()
+    for (const ch of DECISIONS) {
+      await expect(dispatcher.invokeRpc(ch, [{ projectId: 'proj_x', digest: 'ab'.repeat(32), trust: true }], { surface: 'inproc', grantedScopes: ['read', 'operate', 'decide'], clientKind: 'cli' }), ch).rejects.toMatchObject({ code: 'scope_denied' })
+    }
+  })
+
+  it('the in-process client with configure reaches the handlers (a project that does not exist is the first refusal)', async () => {
+    const { dispatcher } = setup()
+    for (const ch of DECISIONS) {
+      await expect(dispatcher.invokeRpc(ch, [{ projectId: 'proj_x', digest: 'ab'.repeat(32), trust: true }], { surface: 'inproc', grantedScopes: HOST_SCOPES, clientKind: 'cli' }), ch).rejects.toThrow()
+      await expect(dispatcher.invokeRpc(ch, [{ projectId: 'proj_x', digest: 'ab'.repeat(32), trust: true }], { surface: 'inproc', grantedScopes: HOST_SCOPES, clientKind: 'cli' }), ch).rejects.not.toMatchObject({ code: 'scope_denied' })
     }
   })
 

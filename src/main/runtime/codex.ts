@@ -1,7 +1,7 @@
 import type { AgentInstance, AgentMessage, ImageAttachment, McpServerSpec, PermissionMode, Role, RunEvent, TranscriptBlock, WorktreeInfo } from '@shared/types'
 import { canNarrowPermissionMode } from './runOverrides'
 import { KNOWLEDGE_RECALL_TOOL, SKILL_HARNESS_TOOLS, isBuiltinConnectionId, isModelTier } from '@shared/types'
-import { effectiveSubagentLimits, effortOptionsFor, isolateWritersOn, newId, projectKindOf, settingTier } from '@shared/defaults'
+import { effectiveSubagentLimits, effortOptionsFor, isolateWritersOn, newId, projectKindOf, settingTier, staffingGoalOf } from '@shared/defaults'
 import { validModelId } from '../connections/codexAccount'
 import { PermissionModeRefusal } from './permissionModeRefusal'
 import { ROOT_AGENT_ID, isSetupLikeRun, type BridgeSpawnResult,type BridgedRole, type CompletionInput, type PeerMessage, type RunConnection, type RuntimeAdapter, type RuntimeContext, type RuntimeSession, type RootTurnEnd, type SessionSettlement, type ExecActivityReason } from './types'
@@ -432,6 +432,8 @@ class CodexSession implements RuntimeSession {
   private mcpRestartPending = false
   /** Root turn ends so far (completed, failed and interrupted): RootTurnEnd.turnGen. */
   private rootTurnGen = 0
+  /** Tool calls the root made this session (any kind, spawns included); a pure direct-answer turn 1 has none. */
+  private rootToolCalls = 0
   /** thread/start or thread/resume requests in flight. */
   private threadStarts = 0
   /** Updates of threads OrgAI has not bound yet, held while a thread start is in flight and re-dispatched after it. */
@@ -473,6 +475,7 @@ class CodexSession implements RuntimeSession {
       tierModels: () => ctx.connection?.tierModels ?? {},
       adapterEfforts: effortOptionsFor('codex'),
       plan: () => ctx.getPlan(),
+      goal: () => staffingGoalOf(ctx.project, ctx.staffingGoal),
       // The project profile's default pick for an unrequested spawn (spec 4.5); none on a fixed project.
       ...staffingProfileDep(ctx)
     })
@@ -531,6 +534,9 @@ class CodexSession implements RuntimeSession {
       updatePlan: (plan) => ctx.updatePlan(plan),
       // Bridged reports are not threads of this session but still count as working reports.
       liveReports: live,
+      directAnswerTurn: () =>
+        ctx.run.kind === 'work' && !this.setupLike && this.continuation.turnGen === 1 && this.rootToolCalls === 0 && live() === 0 && ctx.pendingInteractions() === 0 &&
+        (obligationsFor(ctx.roles, ctx.run.overrides?.strictDelegation === true)[this.root.id]?.length ?? 0) === 0,
       slots: () => agentSlots(ctx, live()),
       ownRoles: () => rootRoleNames(ctx.roles),
       lastReportEndedAt: () => {
@@ -947,6 +953,17 @@ class CodexSession implements RuntimeSession {
   }
 
   /** Steer the running turn of a thread, or start a new one. */
+  /**
+   * The effort a thread's first turn carries: the role's own when Codex takes it (low / medium / high); with none set,
+   * `medium` in a work run (the same default the Claude adapter writes, CLAUDE_SDK_DEFAULT_EFFORT) so Codex's own
+   * default does not decide; none for setup-like runs and quick chats. A role effort Codex does not take (xhigh, max)
+   * stays unset as before.
+   */
+  private turnEffort(own: string | undefined): { effort?: string } {
+    if (own) return ['low', 'medium', 'high'].includes(own) ? { effort: own } : {}
+    return this.setupLike || this.ctx.run.quick ? {} : { effort: 'medium' }
+  }
+
   private sendToThread(threadId: string, text: string, images?: ImageAttachment[], extra: Record<string, unknown> = {}): Promise<void> {
     return this.serialized(threadId, async () => {
       const input = userInput(text, images)
@@ -1371,7 +1388,7 @@ class CodexSession implements RuntimeSession {
       this.emit({ type: 'run.status', runId, status: 'running', sessionId: started.threadId })
       this.log('info', `Codex thread ${started.threadId} started${started.model ? ` (${started.model})` : ''}`)
 
-      const effort = this.root.effort && ['low', 'medium', 'high'].includes(this.root.effort) ? { effort: this.root.effort } : {}
+      const effort = this.turnEffort(this.root.effort)
       await this.sendToThread(started.threadId, firstMessage, ctx.images, effort)
       for (const m of this.earlySends.splice(0)) await this.sendToThread(started.threadId, m.text, m.images)
       await this.closed
@@ -1430,6 +1447,7 @@ class CodexSession implements RuntimeSession {
       case 'toolUse':
         this.transcript(agentId, { kind: 'tool_use', id: u.id, name: u.name, input: u.input })
         if (agent) countUsage(agent, 'toolCalls')
+        if (agentId === ROOT_AGENT_ID) this.rootToolCalls++
         this.setState(agentId, u.state, u.activity)
         return
       case 'toolResult': {
@@ -2249,6 +2267,8 @@ class CodexSession implements RuntimeSession {
           brief: req.brief,
           ...(req.name ? { name: req.name } : {}),
           ...(req.description ? { description: req.description } : {}),
+          ...(req.onCall?.tier ? { tier: req.onCall.tier } : {}),
+          ...(req.onCall?.effort ? { effort: req.onCall.effort } : {}),
           parentAgentId: req.parentId,
           parentRoleId: parentRole.id,
           ...(req.callId ? { toolUseId: req.callId } : {}),
@@ -2393,7 +2413,7 @@ class CodexSession implements RuntimeSession {
       registered = true
       this.ctx.delegation?.noteSpawn(req.id, req.parentId, req.role.id)
       this.transcript(req.id, { kind: 'user', text: req.brief })
-      const effort = staffed.effort ? { effort: staffed.effort } : req.role.effort && ['low', 'medium', 'high'].includes(req.role.effort) ? { effort: req.role.effort } : {}
+      const effort = staffed.effort ? { effort: staffed.effort } : this.turnEffort(req.role.effort)
       // After newAgent, so the "Added N known items" row lands on the report; the block stays out of its transcript entry.
       const knownItems = spawnKnowledge(this.ctx, req.brief, req.id, (m) => this.log('warn', m))
       await this.sendToThread(started.threadId, childFirstMessage(parentLabel, withSpawnKnowledge(req.brief, knownItems)), undefined, effort)

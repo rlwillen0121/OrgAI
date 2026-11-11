@@ -114,12 +114,6 @@ export const DESKTOP_ONLY_CHANNELS: readonly string[] = [
   IPC.projectsRepoTools,
   IPC.projectsCloneRepo,
   IPC.projectsCancelClone,
-  IPC.projectsSetFolderConfigTrust,
-  TEAM_FILES_IPC.teamFilesApprove,
-  TEAM_FILES_IPC.teamFilesReject,
-  TEAM_FILES_IPC.teamFilesUndo,
-  TEAM_FILES_IPC.teamFilesEnable,
-  TEAM_FILES_IPC.teamFilesCommit,
   OUTPUTS_IPC.outputsOpen,
   OUTPUTS_IPC.outputsReveal,
   OUTPUTS_IPC.outputsSaveAs,
@@ -154,12 +148,6 @@ export const DESKTOP_CHANNEL_MUTATES: Readonly<Record<string, boolean>> = {
   [IPC.projectsRepoTools]: false,
   [IPC.projectsCloneRepo]: true,
   [IPC.projectsCancelClone]: false,
-  [IPC.projectsSetFolderConfigTrust]: true,
-  [TEAM_FILES_IPC.teamFilesApprove]: true,
-  [TEAM_FILES_IPC.teamFilesReject]: true,
-  [TEAM_FILES_IPC.teamFilesUndo]: true,
-  [TEAM_FILES_IPC.teamFilesCommit]: true,
-  [TEAM_FILES_IPC.teamFilesEnable]: true,
   [OUTPUTS_IPC.outputsOpen]: false,
   [OUTPUTS_IPC.outputsReveal]: false,
   [OUTPUTS_IPC.outputsSaveAs]: false,
@@ -233,24 +221,8 @@ export function registerIpc(services: IpcServices): void {
   }
 
   // ---- Desktop-only channels ----
-  // Folder config trust: only the user in a window can trust a folder's own agent config (no socket handler exists).
-  handleMutating(activity, IPC.projectsSetFolderConfigTrust, (_e, raw: unknown): FolderConfigTrustResult => {
-    const input = folderConfigTrustArgs(raw)
-    if (!projects.get(input.projectId)) throw new Error('Project not found')
-    // A gated project keeps its saved rules in the data folder (projectRulesFile), never in the folder being judged.
-    const saved = projects.update(input.projectId, (p) => applyFolderConfigTrust(p, input, { rulesFile: projectRulesFile(p, settings.dataDir) }))
-    return { project: saved, review: folderConfigReview(saved) }
-  })
-  // Team files review decisions (approve / reject / undo / enable / commit): the approval card is the window's.
-  const teamFiles = services.teamFiles
-  if (teamFiles) {
-    const filled = async (r: TeamFilesActionResult): Promise<TeamFilesActionResult> => ({ project: r.project, status: await teamFiles.withGit(r.status) })
-    handleMutating(activity, TEAM_FILES_IPC.teamFilesApprove, async (_e, input: unknown) => filled(teamFiles.approve(teamFilesArgs(input, true))))
-    handleMutating(activity, TEAM_FILES_IPC.teamFilesReject, async (_e, input: unknown) => filled(teamFiles.reject(teamFilesArgs(input, true))))
-    handleMutating(activity, TEAM_FILES_IPC.teamFilesUndo, async (_e, input: unknown) => filled(teamFiles.undo(teamFilesArgs(input))))
-    handleMutating(activity, TEAM_FILES_IPC.teamFilesCommit, async (_e, input: unknown): Promise<TeamFilesCommitResult> => teamFiles.commit(teamFilesArgs(input)))
-    handleMutating(activity, TEAM_FILES_IPC.teamFilesEnable, async (_e, input: unknown) => filled(teamFiles.enable(teamFilesArgs(input))))
-  }
+  // Folder config trust and the team files review decisions are dispatcher channels (scope 'configure': the window
+  // and the in-process CLI; a socket client is refused there).
   handleReadOnly(IPC.projectsPickDir, async (e) => {
     const win = BrowserWindow.fromWebContents(e.sender)
     const result = win

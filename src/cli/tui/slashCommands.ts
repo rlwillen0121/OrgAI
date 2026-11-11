@@ -5,11 +5,15 @@
  */
 import { runIndexMap, runName, runTag } from '../../shared/view/runLabels'
 import { agentLabel, statusWordOfSummary } from '../render'
+import { basename } from 'node:path'
 import { helpKeyLines } from './keymap'
+import { copyToClipboard, lastAssistantText, latestCodeBlock } from './clipboard'
+import { CYCLE_MODES, EFFORT_WORDS, GOAL_WORDS, modeInForce, modeSwitchHint, modelSwitchBlock, pickModel, isTier } from './runControls'
 import { sanitizeTty } from './sanitizeTty'
 import { offersRetro } from './selectors'
 import { usageText } from './usageText'
-import type { RunSummary } from '../../shared/types'
+import { analyzeText, applyText, historyText, parseEvolve, rollbackText } from './evolve'
+import { type Effort, type PermissionMode, type RunSummary, type StaffingGoal } from '../../shared/types'
 import type { SlashCommand, SlashContext, TuiState } from './types'
 
 /** One line of untrusted text, sanitized, whitespace folded, at most `max` characters. */
@@ -311,9 +315,210 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
       })
   },
   {
+    name: 'model',
+    args: '[fast|everyday|deep|top|<model id>]',
+    summary: "Show or switch the root agent's model (live at an idle moment, else for the next message or run)",
+    available: (s) => !s.readOnlyReason,
+    unavailableReason: readOnlyText,
+    run: (ctx, args) =>
+      guarded(ctx, async () => {
+        const s = ctx.state()
+        const run = activeSummary(s)
+        const staged = ctx.session.getStaged()
+        const arg = cleanLine(args, 200)
+        const current = run ? run.modelSelection : staged.model
+        if (!arg) {
+          const now = current ? `${cleanLine(current.model, 80)} on ${cleanLine(String(current.connection), 40)}` : "the project's default"
+          ctx.notify(`Model: ${now}${run ? '' : ' (for the next run)'}. Use /model fast|everyday|deep|top|<model id>.`)
+          return
+        }
+        const models = await ctx.session.listModels(isTier(arg.toLowerCase()) ? current?.connection : undefined)
+        const picked = pickModel(models, arg, current?.connection)
+        if ('error' in picked) {
+          ctx.notify(picked.error, 'warn')
+          return
+        }
+        const label = `${cleanLine(picked.label || picked.id, 80)} (${cleanLine(picked.id, 80)})`
+        if (!run) {
+          ctx.session.stage({ model: { model: picked.id, connection: picked.connection } })
+          ctx.notify(`The next run starts on ${label}.`)
+          return
+        }
+        const blocked = modelSwitchBlock(s, picked)
+        if (blocked) {
+          ctx.notify(blocked, 'warn')
+          return
+        }
+        const res = await ctx.session.switchModel({ model: picked.id, connection: picked.connection })
+        // `applied` false with a saved selection means the next continuation, not now; a switch never sends anything.
+        if (res.applied) ctx.notify(`Now using ${label}.`)
+        else ctx.notify(`${label} is saved for the next message.${res.reason ? ` ${cleanLine(res.reason, 200)}` : ''}`, 'warn')
+      })
+  },
+  {
+    name: 'effort',
+    args: '[low|medium|high|xhigh|max]',
+    summary: "Choose the root agent's reasoning effort for the next run",
+    available: (s) => !s.readOnlyReason,
+    unavailableReason: readOnlyText,
+    run: (ctx, args) =>
+      guarded(ctx, () => {
+        const word = cleanLine(args, 20).toLowerCase()
+        const run = activeSummary(ctx.state())
+        const staged = ctx.session.getStaged()
+        if (!word) {
+          const now = run?.rootEffort ?? staged.effort
+          ctx.notify(`Effort: ${now ?? "the role's own"}${staged.effort && run ? ` (next run: ${staged.effort})` : ''}. Use /effort ${EFFORT_WORDS.join('|')}.`)
+          return
+        }
+        if (!(EFFORT_WORDS as readonly string[]).includes(word)) {
+          ctx.notify(`Effort is one of ${EFFORT_WORDS.join(', ')}.`, 'warn')
+          return
+        }
+        ctx.session.stage({ effort: word as Effort })
+        ctx.notify(`The next run starts at ${word} effort.${run ? ' The followed run keeps its own.' : ''}`)
+      })
+  },
+  {
+    name: 'mode',
+    args: '[default|acceptEdits|plan|auto]',
+    summary: 'Show or change the permission mode (Shift+Tab cycles it from the composer)',
+    available: (s) => !s.readOnlyReason,
+    unavailableReason: readOnlyText,
+    run: (ctx, args) =>
+      guarded(ctx, async () => {
+        const s = ctx.state()
+        const run = activeSummary(s)
+        const staged = ctx.session.getStaged()
+        const word = cleanLine(args, 24)
+        if (!word) {
+          const now = modeInForce(run, staged.permissionMode)
+          ctx.notify(`Mode: ${now ?? "the project's"}${run ? '' : ' (for the next run)'}. ${modeSwitchHint(s)}`)
+          return
+        }
+        const mode = (CYCLE_MODES as readonly string[]).find((m) => m.toLowerCase() === word.toLowerCase()) as PermissionMode | undefined
+        if (!mode) {
+          ctx.notify(`Mode is one of ${CYCLE_MODES.join(', ')}.`, 'warn')
+          return
+        }
+        await ctx.setMode(mode)
+      })
+  },
+  {
+    name: 'goal',
+    args: '[balanced|speed|cost]',
+    summary: 'Staffing goal for the next run or continuation (balanced, speed or cost)',
+    available: (s) => !s.readOnlyReason,
+    unavailableReason: readOnlyText,
+    run: (ctx, args) =>
+      guarded(ctx, () => {
+        const word = cleanLine(args, 20).toLowerCase()
+        const staged = ctx.session.getStaged()
+        if (!word) {
+          ctx.notify(`Staffing goal: ${staged.goal ?? "the project's"}. Use /goal ${GOAL_WORDS.join('|')}.`)
+          return
+        }
+        if (!(GOAL_WORDS as readonly string[]).includes(word)) {
+          ctx.notify(`Goal is one of ${GOAL_WORDS.join(', ')}.`, 'warn')
+          return
+        }
+        ctx.session.stage({ goal: word as StaffingGoal })
+        ctx.notify(`The next run or continuation staffs for ${word}. A run already working keeps its goal.`)
+      })
+  },
+  {
+    name: 'save-project',
+    aliases: ['save'],
+    args: '[name]',
+    summary: 'Save this chat (a quick run) as a project',
+    available: (s) => !s.readOnlyReason && !!activeSummary(s)?.quick,
+    unavailableReason: (s) => (s.readOnlyReason ? readOnlyText(s) : 'Only a chat started without a project can be saved as one. Follow it first.'),
+    run: (ctx, args) =>
+      guarded(ctx, async () => {
+        const s = ctx.state()
+        const run = activeSummary(s)
+        if (!run?.quick) {
+          ctx.notify('Only a chat started without a project can be saved as one.', 'warn')
+          return
+        }
+        if (run.status === 'starting' || run.status === 'running' || run.status === 'idle' || run.status === 'stopping') {
+          ctx.notify('End the session first (/stop), then /save-project.', 'warn')
+          return
+        }
+        const name = cleanLine(args, 80) || cleanLine(basename(s.folder), 80) || 'Project'
+        const res = await ctx.session.promoteQuick(name)
+        if (res.kind === 'existing') {
+          ctx.notify(`This folder is already the project ${cleanLine(res.name, 80)}.`, 'warn')
+          return
+        }
+        ctx.notify(`Saved as the project ${cleanLine(res.project.name, 80)}.`)
+        if (ctx.openProject) await ctx.openProject(res.project, res.run.id)
+      })
+  },
+  {
+    name: 'evolve',
+    args: '[analyze|apply [deterministic|hybrid]|history|rollback [genId]]',
+    summary: 'Analyze run waste and evolve the team chart (apply and rollback change the project)',
+    available: (s) => !s.readOnlyReason,
+    unavailableReason: readOnlyText,
+    run: (ctx, args) =>
+      guarded(ctx, async () => {
+        const req = parseEvolve(args)
+        if (req.kind === 'error') {
+          ctx.notify(req.message, 'warn')
+          return
+        }
+        const s = ctx.state()
+        const project = s.project
+        if (!project) {
+          ctx.notify('/evolve needs a saved project. Open a project folder first (a quick chat can be saved with /save-project).', 'warn')
+          return
+        }
+        const projectId = project.id
+        if ((req.kind === 'apply' || req.kind === 'rollback') && (s.readOnlyReason || activeSummary(s)?.status === 'running' || activeSummary(s)?.status === 'starting')) {
+          ctx.notify('A run is working. Changing the chart mid-run is confusing: wait for it, or /interrupt it, then /evolve.', 'warn')
+          return
+        }
+        if (req.kind === 'analyze') {
+          await ctx.openText('Team evolution', analyzeText(await ctx.session.evolveAnalyze({ projectId })))
+        } else if (req.kind === 'history') {
+          await ctx.openText('Team evolution history', historyText(await ctx.session.evolveHistory(projectId)))
+        } else if (req.kind === 'apply') {
+          if (req.strategy === 'hybrid') ctx.notify('Hybrid makes one tracked model call on the host to draft the plan.')
+          const res = await ctx.session.evolveApply({ projectId, strategy: req.strategy })
+          const text = applyText(res, req.strategy)
+          ctx.notify(res.applied ? `Evolved the team${res.generation ? ` (${cleanLine(res.generation.id, 20)})` : ''}. The org tree shows the new chart.` : `Nothing applied: ${cleanLine(res.reason, 120) || 'no change'}.`, res.applied ? 'ok' : 'warn')
+          await ctx.openText('Team evolution applied', text)
+        } else {
+          const res = await ctx.session.evolveRollback({ projectId, ...(req.generationId ? { generationId: req.generationId } : {}) })
+          ctx.notify(rollbackText(res), res.rolledBack ? 'ok' : 'warn')
+        }
+      })
+  },
+  {
+    name: 'copy',
+    args: '[code]',
+    summary: 'Copy the last assistant message (or its latest code block with "code")',
+    available: (s) => lastAssistantText(s) !== undefined,
+    unavailableReason: () => 'There is no assistant message to copy yet.',
+    run: (ctx, args) =>
+      guarded(ctx, async () => {
+        const s = ctx.state()
+        const wantCode = cleanLine(args, 20).toLowerCase() === 'code'
+        const text = wantCode ? latestCodeBlock(s) : lastAssistantText(s)
+        if (!text) {
+          ctx.notify(wantCode ? 'No code block in the recent messages.' : 'There is no assistant message to copy yet.', 'warn')
+          return
+        }
+        const via = ctx.copyText ? await ctx.copyText(text) : await copyToClipboard(text)
+        if (via.length === 0) ctx.notify('Could not reach a clipboard. Select the text with the mouse instead.', 'warn')
+        else ctx.notify(`Copied ${wantCode ? 'the code block' : 'the last message'} (${Array.from(text).length} characters).`)
+      })
+  },
+  {
     name: 'quit',
     aliases: ['q', 'exit'],
-    summary: 'Leave the terminal UI (runs keep going)',
+    summary: 'Leave the terminal UI (active runs are stopped; it asks first)',
     run: (ctx) => guarded(ctx, () => ctx.quit())
   }
 ]
