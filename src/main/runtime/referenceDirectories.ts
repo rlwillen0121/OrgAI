@@ -1,6 +1,6 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join, posix, win32 } from 'node:path'
-import { canonicalDeep, isInside } from '../quick/scratch'
+import { canonicalDeep, isInside, type CanonicalMemo } from '../quick/scratch'
 import { SHELL_TOOLS, segmentWords, splitCommand, unwrapShellCommand } from './ruleMatch'
 
 /**
@@ -206,6 +206,10 @@ interface CheckState {
   refs: RefEntry[]
   real: boolean
   cache: Map<string, string>
+  /** checkWord answers of THIS scan only (never shared between scans: file system state may change between commands). */
+  wordMemo: Map<string | undefined, Map<string, string | null>>
+  /** existsSync / realpath answers of THIS scan only. */
+  fsMemo: CanonicalMemo
   words: number
   parts: number
   /** mode 'self-control': only definite AT-or-UNDER hits, never a fail-closed answer. */
@@ -219,13 +223,21 @@ interface CheckState {
   limited: boolean
 }
 
+/** An absolute POSIX path in normal form: segments are non-empty and neither '.' nor '..', no trailing '/' (except the root). */
+const CLEAN_POSIX = /^\/$|^(?:\/(?!\.\.?(?:\/|$))[^/\0]+)+$/
+
 function fold(s: CheckState, v: string): string {
   return s.platform === 'win32' || s.platform === 'darwin' ? v.toLowerCase() : v
 }
 
 /** True when `child` is `parent` or inside it (path.relative, never a string prefix). */
 function within(s: CheckState, parent: string, child: string): boolean {
-  const r = s.p.relative(fold(s, parent), fold(s, child))
+  const a = fold(s, parent)
+  const b = fold(s, child)
+  // POSIX fast path, same answer as path.relative for clean absolute paths (no empty, '.' or '..' segments, no trailing
+  // separator): at or under the folder. Anything else takes the general path below.
+  if (s.p === posix && CLEAN_POSIX.test(a) && CLEAN_POSIX.test(b)) return b === a || (a === '/' ? true : b.startsWith(`${a}/`))
+  const r = s.p.relative(a, b)
   return r === '' || (r !== '..' && !r.startsWith(`..${s.p.sep}`) && !s.p.isAbsolute(r))
 }
 
@@ -235,7 +247,7 @@ function realOf(s: CheckState, abs: string): string {
   let real = abs
   if (!isUncLike(abs)) {
     try {
-      real = canonicalDeep(abs)
+      real = canonicalDeep(abs, s.fsMemo)
     } catch {
       // Unresolvable: the lexical spelling alone.
     }
@@ -496,6 +508,18 @@ function globReaches(s: CheckState, full: string): string | null {
 
 function checkWord(s: CheckState, part: string, cwd: string | undefined): string | null {
   if (!part) return null
+  // Pure within one scan (refs, platform, home and the real-path cache do not change), so a repeated word is answered once.
+  // Nested maps, never a joined string: the answer depends on exactly the pair (cwd, part) and no separator character is safe.
+  let byWord = s.wordMemo.get(cwd)
+  if (!byWord) s.wordMemo.set(cwd, (byWord = new Map()))
+  const known = byWord.get(part)
+  if (known !== undefined) return known
+  const answer = checkWordUncached(s, part, cwd)
+  byWord.set(part, answer)
+  return answer
+}
+
+function checkWordUncached(s: CheckState, part: string, cwd: string | undefined): string | null {
   const full = resolveWord(s, part, cwd)
   if (GLOB_CHAR.test(part)) {
     if (full) {
@@ -651,6 +675,8 @@ function scanReferenceTouch(
     refs: entries,
     real: platform === process.platform,
     cache: new Map(),
+    wordMemo: new Map(),
+    fsMemo: { exists: new Map(), canonical: new Map() },
     words: 0,
     parts: 0,
     definite: opts.mode === 'self-control',
@@ -704,6 +730,8 @@ function definiteState(refs: readonly string[], opts: Pick<ReferenceCheckOptions
     refs: entries,
     real: platform === process.platform,
     cache: new Map(),
+    wordMemo: new Map(),
+    fsMemo: { exists: new Map(), canonical: new Map() },
     words: 0,
     parts: 0,
     definite: true,

@@ -283,3 +283,14 @@ describe('localDrivePathOf (review round 2)', () => {
     }
   })
 })
+
+describe('per-scan word cache keys (reviewer CRITICAL 1)', () => {
+  it('a word and a cd whose joined spelling would collide are still told apart', () => {
+    const PREF = '/srv/acme'
+    const PCWD = '/srv/proj'
+    const cmd = `cat 'foo\x01${PREF}/x'; cd '${PCWD}\x01foo'; cat ${PREF}/x`
+    const alone = `cat ${PREF}/x`
+    expect(commandReferenceTouch(alone, PCWD, [PREF], { platform: 'linux' })).not.toBeNull()
+    expect(commandReferenceTouch(cmd, PCWD, [PREF], { platform: 'linux' })).not.toBeNull()
+  })
+})

@@ -146,7 +146,7 @@ export interface ControlProtectedExtras {
 }
 
 /** The control entries of a data folder. */
-const CONTROL_ENTRIES = ['run', 'secrets.json', 'codex', 'settings.json', 'auth-cwd'] as const
+const CONTROL_ENTRIES = ['run', 'secrets.json', 'codex', 'settings.json', 'auth-cwd', 'evolution'] as const
 
 /**
  * The paths the gate protects, each in its lexical (path.resolve) and canonical (canonicalDeep: real path of the
@@ -648,6 +648,26 @@ const CUSTODIAN_CODE: readonly RegExp[] = [
   /CryptUnprotectData|ProtectedData/i
 ]
 
+/**
+ * The CLI named as a command inside code text, in a call that spawns a process: `subprocess.run(['orgai', 'x'])`,
+ * `os.system('orgai status')`, `execSync('orgai status')`, `` `orgai status` ``, `%x(orgai)`, `$(orgai)`, with the name
+ * (lowercase, or `@orgai/cli`, optionally behind a path) as a whole word. Prose (`print('see orgai status')`), a
+ * directory (`chdir('/orca/OrgAI')`, `/x/orgai/y`), `orgai_utils` and `orgai.json` are not it.
+ */
+const CLI_CODE = new RegExp(
+  '(?:\\b(?:system|popen\\d?|run|call|check_call|check_output|Popen|exec[A-Za-z]*|spawn[A-Za-z]*|shell_exec|passthru|startfile)\\s*\\(\\s*\\[?|`|%x[\\[{(]|\\$\\()\\s*[\'"]?\\s*' +
+    '(?:[^\\s\'"`()\\[\\],;]*[\\\\/])?(?:orgai(?:-cli)?(?:\\.(?:exe|cmd|bat|ps1|mjs|js))?|@orgai\\/cli)(?=$|[\\s\'"`,)\\]])'
+)
+
+/** A code runner's program word as the name it runs under, or undefined; a glob that may expand to one counts (`/usr/bin/pyth*`). */
+function codeRunnerName(prog: string): string | undefined {
+  const exact = wordNames(prog).find(isCodeRunner)
+  if (exact !== undefined) return exact
+  if (!GLOB_CHARS.test(binName(prog))) return undefined
+  const names = [...CODE_RUNNERS, 'python3', 'python3.12']
+  return wordMayBe(prog, names) ? 'python3' : undefined
+}
+
 /** A code runner's program name: CODE_RUNNERS, versioned pythons (`python3.12`) included. */
 function isCodeRunner(bare: string): boolean {
   return CODE_RUNNERS.has(bare) || /^python[\d.]*$/.test(bare)
@@ -683,11 +703,16 @@ function custodianCodeRuns(text: string): boolean {
     const at = programIndex(words)
     const prog = words[at]
     if (prog === undefined) continue
-    const bare = wordNames(prog).find(isCodeRunner)
+    const bare = codeRunnerName(prog)
     if (bare === undefined) continue
     const rest = words.slice(at + 1)
     if (CUSTODIAN_CODE.some((re) => re.test(seg.text))) return true
-    if (rest.some((w) => /^\d*<<(?!<)/.test(w))) return true
+    if (CLI_CODE.test(seg.text)) return true
+    // A here-document: its body sits on later lines, so any custodian word in the text counts (the CLI is only caught by its call).
+    const heredoc = rest.some((w) => /^\d*<<(?!<)/.test(w))
+    if (heredoc && CUSTODIAN_CODE.some((re) => re.test(text))) return true
+    // The same body can call the CLI (`python3 <<'EOF' ... subprocess.run(['orgai', ...]) ... EOF`): the call-context matcher, not a mention.
+    if (heredoc && CLI_CODE.test(text)) return true
     if (seg.pipeIn && codeRunnerReadsStdin(bare, rest) && segments.slice(0, k).some((u) => CUSTODIAN_CODE.some((re) => re.test(u.text)))) return true
   }
   return false
@@ -861,6 +886,14 @@ function cliSegments(text: string, keepBraces = false): CliSegment[] {
       i++
       push(false)
       continue
+    }
+    // A brace inside an open glob bracket (`[{-p]rgai`, `[}-p]rgai`) is part of the word, not a group.
+    if (ch === '{' || ch === '}') {
+      const word = cur.slice(cur.search(/\S*$/))
+      if (word.lastIndexOf('[') > word.lastIndexOf(']')) {
+        cur += ch
+        continue
+      }
     }
     if (ch === ')' || ch === '}') {
       if (ch === '}' && keepBraces) {
@@ -1108,7 +1141,9 @@ function wordsRunCli(words: readonly string[], depth: number, budget: CliBudget,
   }
   // `sh <file>`, `bash -e <file>`: a POSIX shell runs its first non-option argument as a script.
   if (SCRIPT_SHELLS.has(bare) && shellScriptIsCli(rest, check)) return true
-  if (NESTING_SHELLS.has(bare) || bare === 'eval') {
+  // A shell named by a glob (`/bin/ba?h -c 'orgai status'`, `/bin/b*sh -c ...`) reads its -c text the same way.
+  const globShell = !NESTING_SHELLS.has(bare) && GLOB_CHARS.test(name) && wordMayBe(prog, [...NESTING_SHELLS])
+  if (NESTING_SHELLS.has(bare) || globShell || bare === 'eval') {
     for (let k = 0; k < rest.length; k++) {
       const inner = bare === 'eval' ? rest.join(' ') : NESTING_FLAGS.test(rest[k]) ? rest.slice(k + 1).join(' ') : null
       if (inner === null) continue
@@ -1226,7 +1261,52 @@ function spellings(word: string): string[] {
   return unescaped === word ? [word] : [word, unescaped]
 }
 
-/** A glob component (`orga?`, `*`, `[o]rgai`, `[!x]*`) as a whole-string, case-insensitive pattern. */
+/**
+ * A glob bracket body (after any `!` / `^` negation) as a regex character class body, or null when the bracket must
+ * fail closed to "any single character": a range the shell may collate by locale (macOS bash 3.2 and /bin/sh read
+ * `[~-p]`, `[é-p]`, `[{-p]` by collation, not by code point), which is any range whose endpoints are not both ASCII
+ * letters of one case or both digits in order (this includes reversed ranges such as the `=-3` of a quoted
+ * `cents=-3`), and any non-ASCII character. Otherwise backslashes and class metacharacters are escaped.
+ */
+function classBody(body: string): string | null {
+  if (/[^\x00-\x7f]/.test(body)) return null
+  let out = ''
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i]
+    if (c === '-' && i > 0 && i < body.length - 1) {
+      const lo = body[i - 1]
+      const hi = body[i + 1]
+      const same = (re: RegExp): boolean => re.test(lo) && re.test(hi)
+      if (!((same(/[a-z]/) || same(/[A-Z]/) || same(/[0-9]/)) && lo <= hi)) return null
+      out += '-'
+    } else if (c === '\\' || c === ']' || c === '^' || c === '-' || c === '[') out += `\\${c}`
+    else out += c
+  }
+  return out
+}
+
+/**
+ * The index of the `]` closing the bracket opened at `open` when that bracket holds a POSIX item (`[:name:]`, `[.x.]`,
+ * `[=x=]`) anywhere in its body, else -1 (no such item, or the bracket never closes).
+ */
+function posixBracketEnd(pattern: string, open: number): number {
+  let j = open + 1
+  if (pattern[j] === '!' || pattern[j] === '^') j++
+  if (pattern[j] === ']') j++
+  let posix = false
+  for (; j < pattern.length; j++) {
+    const c = pattern[j]
+    if (c === '[' && (pattern[j + 1] === ':' || pattern[j + 1] === '.' || pattern[j + 1] === '=')) {
+      const close = pattern.indexOf(`${pattern[j + 1]}]`, j + 2)
+      if (close === -1) return -1
+      posix = true
+      j = close + 1
+    } else if (c === ']') return posix ? j : -1
+  }
+  return -1
+}
+
+/** A glob component (`orga?`, `*`, `[o]rgai`, `[!x]*`, `[^x]*`) as a whole-string, case-insensitive pattern. */
 function globRegex(pattern: string): RegExp {
   let re = ''
   for (let i = 0; i < pattern.length; i++) {
@@ -1234,12 +1314,26 @@ function globRegex(pattern: string): RegExp {
     if (ch === '*') re += '.*'
     else if (ch === '?') re += '.'
     else if (ch === '[') {
+      // A POSIX class, collating symbol or equivalence class anywhere in the bracket (`[[:alpha:]]`, `[x[:alpha:]]`,
+      // `[[.a.]]`, `[[=a=]]`): the whole bracket reads as any one character.
+      const posixEnd = posixBracketEnd(pattern, i)
+      if (posixEnd !== -1) {
+        re += '.'
+        i = posixEnd
+        continue
+      }
       const end = pattern.indexOf(']', i + 2)
       if (end === -1) re += '\\['
       else {
         let body = pattern.slice(i + 1, end)
-        if (body.startsWith('!')) body = `^${body.slice(1)}`
-        re += `[${body.replace(/\\/g, '\\\\')}]`
+        let neg = ''
+        // bash, zsh and sh all read a leading `!` or `^` as negation.
+        if (body.startsWith('!') || body.startsWith('^')) {
+          neg = '^'
+          body = body.slice(1)
+        }
+        const cls = classBody(body)
+        re += cls === null ? '.' : `[${neg}${cls}]`
         i = end
       }
     } else re += ch.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
@@ -1442,7 +1536,7 @@ function textRunsCli(text: string, depth: number, budget: CliBudget, check: CliC
   if (/\bsetx\s+ELECTRON_RUN_AS_NODE\b/i.test(plain)) return true
   for (const segment of cliSegments(plain)) if (assignsElectronAsNode(segment.text)) return true
   // Wave 7: code run by an interpreter (inline, piped or a here-document) that calls a key custodian tool.
-  if (CUSTODIAN_CODE.some((re) => re.test(text)) && custodianCodeRuns(text)) return true
+  if ((CUSTODIAN_CODE.some((re) => re.test(text)) || CLI_CODE.test(text)) && custodianCodeRuns(text)) return true
   // A second pass keeps brace expansions whole (`<Resources>/bin/orga{i,} status`) when there are any.
   for (const keepBraces of /\{[^\s{}]*(?:,|\.\.)[^\s{}]*\}/.test(text) ? [false, true] : [false]) {
     const segments = cliSegments(text, keepBraces)

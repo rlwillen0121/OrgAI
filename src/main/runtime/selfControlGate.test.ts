@@ -30,7 +30,7 @@ describe('controlProtectedPaths', () => {
     const data = join(base, 'data')
     mkdirSync(data)
     const paths = controlProtectedPaths(data)
-    expect(paths).toEqual([join(data, 'run'), join(data, 'secrets.json'), join(data, 'codex'), join(data, 'settings.json'), join(data, 'auth-cwd')])
+    expect(paths).toEqual([join(data, 'run'), join(data, 'secrets.json'), join(data, 'codex'), join(data, 'settings.json'), join(data, 'auth-cwd'), join(data, 'evolution')])
     expect(paths).toContain(join(data, 'settings.json'))
     expect(paths).toContain(join(data, 'auth-cwd'))
     // agents cannot write into or replace the auth probe's folder
@@ -48,7 +48,7 @@ describe('controlProtectedPaths', () => {
     mkdirSync(data)
     const key = join(base, 'keys', 'orgai.key')
     const paths = controlProtectedPaths(data, undefined, { vaultKeyFiles: [key, ''] })
-    expect(paths).toEqual([join(data, 'run'), join(data, 'secrets.json'), join(data, 'codex'), join(data, 'settings.json'), join(data, 'auth-cwd'), key])
+    expect(paths).toEqual([join(data, 'run'), join(data, 'secrets.json'), join(data, 'codex'), join(data, 'settings.json'), join(data, 'auth-cwd'), join(data, 'evolution'), key])
     expect(controlProtectedPaths(data, undefined, { vaultKeyFiles: [] })).toEqual(controlProtectedPaths(data))
   })
 
@@ -88,7 +88,7 @@ describe('controlProtectedPaths', () => {
       expect(paths).toContain(join(real, p))
     }
     expect(new Set(paths).size).toBe(paths.length)
-    expect(paths).toHaveLength(10)
+    expect(paths).toHaveLength(12)
   })
 
   it('never includes the data dir itself, quick/, project-skills/ or skills/', () => {
@@ -2006,5 +2006,144 @@ describe('wave 7 K6 / K7', () => {
   })
   it.each(['yarn test', 'pnpm install', 'bun run build', 'deno run main.ts', 'yarn run lint'])('allows %s', (cmd) => {
     expect(checkSelfControlDenial('Bash', { command: cmd }, { protectedPaths: [], cwd: '/work/repo', platform: 'darwin', cliRoots: [] })).toBeNull()
+  })
+})
+
+describe('quoted inline scripts that read like reversed glob ranges', () => {
+  const c: SelfControlContext = { protectedPaths: [], cwd: '/work/repo', platform: 'darwin', cliRoots: [] }
+  const verdict = (cmd: string): string | null => checkSelfControlDenial('Bash', { command: cmd }, c)
+  it.each([
+    'python3 -c "import ledger; E=[dict(id=1,cents=-3,note=\'x\')]; print(len(E))"',
+    'python3 -c "E=[dict(a=1,cents=-3)]; print([e for e in E if e[\'cents\']<0])"',
+    'node -e "const E=[{cents:-3}]; console.log(E.length, \'org cli letters\')"',
+    'node -e "console.log([1,2].map(x=>x*2), [a=-3])"'
+  ])('allows %s', (cmd) => {
+    expect(verdict(cmd)).toBeNull()
+  })
+  it.each([
+    "python3 -c \"import subprocess; subprocess.run(['orgai', 'status'])\"",
+    "python3 -c \"import subprocess; E=[dict(cents=-3)]; subprocess.run(['orgai', 'status'])\"",
+    'python3 -c "import os; E=[dict(cents=-3)]; os.system(\'security dump-keychain\')"',
+    '/usr/bin/pyth* -c "import os; os.system(\'orgai status\')"',
+    '[o]rgai status',
+    '[no]px @orgai/cli',
+    'org* status',
+    '/bin/ba?h -c "orgai status"'
+  ])('still denies %s', (cmd) => {
+    expect(verdict(cmd), cmd).not.toBeNull()
+  })
+})
+
+describe('glob brackets: negation, locale ranges and POSIX classes fail closed', () => {
+  const c: SelfControlContext = { protectedPaths: [], cwd: '/work/repo', platform: 'darwin', cliRoots: [] }
+  const verdict = (cmd: string): string | null => checkSelfControlDenial('Bash', { command: cmd }, c)
+  const denied = [
+    // `[^x]` negates like `[!x]`
+    '/usr/local/bin/[^a]rgai status',
+    '[^a]rgai status',
+    '/usr/local/bin/o[^a]gai status',
+    '/usr/bin/s[^a]curity find-generic-password -w -s "OrgAI Vault"',
+    '/usr/bin/[^a]ecret-tool lookup service OrgAI',
+    'npx [^a]rgai status',
+    'env [^a]rgai status',
+    'env /usr/local/bin/[^a]rgai status',
+    'echo x | xargs /usr/local/bin/[^a]rgai status',
+    'find . -exec /usr/local/bin/[^a]rgai status \;',
+    "bash -c '/usr/local/bin/[^a]rgai status'",
+    'sh -c "/usr/bin/s[^a]curity dump-keychain"',
+    // ranges the shell may collate by locale
+    '/usr/local/bin/[~-p]rgai status',
+    '/usr/local/bin/[é-p]rgai status',
+    '/usr/bin/s[~-f]curity dump-keychain',
+    "sh -c '/usr/local/bin/[~-p]rgai status'",
+    '/usr/local/bin/[{-p]rgai status',
+    '/usr/local/bin/[}-p]rgai status',
+    // POSIX classes
+    '/usr/local/bin/[[:alpha:]]rgai status',
+    '/usr/local/bin/[x[:alpha:]]rgai status',
+    '/usr/local/bin/[^[:digit:]]rgai status',
+    '/usr/bin/s[x[:alpha:]]curity dump-keychain',
+    '/usr/local/bin/o[[.r.]]gai status',
+    '/usr/local/bin/o[[=r=]]gai status'
+  ]
+  it.each(denied)('denies %s', (cmd) => {
+    expect(verdict(cmd), cmd).not.toBeNull()
+  })
+  it('still allows a quoted script whose brackets cannot make a guarded name', () => {
+    expect(verdict('python3 -c "import ledger; E=[dict(a=1,cents=-3)]; print(E)"')).toBeNull()
+  })
+})
+
+describe('inline code naming the CLI needs a spawning call', () => {
+  const c: SelfControlContext = { protectedPaths: [], cwd: '/work/repo', platform: 'darwin', cliRoots: [] }
+  const verdict = (cmd: string): string | null => checkSelfControlDenial('Bash', { command: cmd }, c)
+  it.each([
+    'python3 -c "print(\'see orgai status for details\')"',
+    'node -e "console.log(\'orgai\')"',
+    'python3 -c "import os; os.chdir(\'/Users/x/orca/OrgAI\')"',
+    'cd /Users/x/orca/OrgAI && python3 - <<EOF\nprint(1)\nEOF',
+    'python3 -c "import orgai_utils"'
+  ])('allows %s', (cmd) => {
+    expect(verdict(cmd), cmd).toBeNull()
+  })
+  it.each([
+    "python3 -c \"import subprocess; subprocess.run(['orgai','status'])\"",
+    "python3 -c \"import os; os.system('orgai status')\"",
+    "node -e \"require('child_process').execSync('orgai status')\"",
+    "/usr/bin/pyth* -c \"import os; os.system('orgai status')\"",
+    '/bin/ba?h -c "orgai status"',
+    'npx @orgai/cli status',
+    "node -e \"require('child_process').spawn('/usr/local/bin/orgai', ['status'])\"",
+    "ruby -e 'puts `orgai status`'"
+  ])('still denies %s', (cmd) => {
+    expect(verdict(cmd), cmd).not.toBeNull()
+  })
+})
+
+describe('per-scan word cache cannot be confused by a separator character (reviewer CRITICAL 1)', () => {
+  function data(): { data: string; refs: string[]; cwd: string } {
+    const base = fsRealpath.native(mkdtempSync(join(tmpdir(), 'orgai-scg-memo-')))
+    dirs.push(base)
+    const d = join(base, 'data')
+    for (const e of ['run', 'codex', 'evolution']) mkdirSync(join(d, e), { recursive: true })
+    return { data: d, refs: controlProtectedPaths(d), cwd: base }
+  }
+  it.each([
+    ['read', (d: string) => `cat ${d}/run/daemon.secret`],
+    ['write', (d: string) => `echo x > ${d}/secrets.json`],
+    ['evolution ledger write', (d: string) => `echo x > ${d}/evolution/p.json`]
+  ])('still denies a %s after a word and a cd that share the joined spelling', (_name, tail) => {
+    const s = data()
+    const ctx: SelfControlContext = { protectedPaths: s.refs, cwd: s.cwd, home: s.cwd }
+    const target = tail(s.data).replace(/^(?:cat|echo x >) /, '')
+    const bypass = `cat 'foo\x01${target}'; cd '${s.cwd}\x01foo'; ${tail(s.data)}`
+    expect(checkSelfControlDenial('Bash', { command: tail(s.data) }, ctx)).toBe(SELF_CONTROL_DENIAL_MESSAGE)
+    expect(checkSelfControlDenial('Bash', { command: bypass }, ctx)).toBe(SELF_CONTROL_DENIAL_MESSAGE)
+  })
+  it('denies writes under <data>/evolution (the ledger holds snapshots)', () => {
+    const s = data()
+    const ctx: SelfControlContext = { protectedPaths: s.refs, cwd: s.cwd, home: s.cwd }
+    expect(checkSelfControlDenial('Write', { file_path: join(s.data, 'evolution', 'p1.json'), content: '{}' }, ctx)).toBe(SELF_CONTROL_DENIAL_MESSAGE)
+    expect(checkSelfControlDenial('Bash', { command: `echo x > ${s.data}/evolution/p.json` }, ctx)).toBe(SELF_CONTROL_DENIAL_MESSAGE)
+  })
+})
+
+describe('code runners fed by a here-document that call the CLI (reviewer MEDIUM 7)', () => {
+  const ctx: SelfControlContext = { protectedPaths: [], cwd: '/work', home: '/home/u', platform: 'linux' }
+  it.each([
+    "python3 <<'EOF'\nimport subprocess\nsubprocess.run(['orgai','org','evolve','--apply'])\nEOF",
+    'python3 - <<EOF\nimport os\nos.system("orgai org evolve --apply")\nEOF',
+    "node <<EOF\nrequire('child_process').execSync('orgai runs stop R1')\nEOF",
+    "node <<EOF\nrequire('child_process').spawnSync('orgai', ['org','evolve'])\nEOF",
+    `python3 <<< "import os; os.system('orgai status')"`
+  ])('denies %j', (command) => {
+    expect(checkSelfControlDenial('Bash', { command }, ctx)).toBe(SELF_CONTROL_DENIAL_MESSAGE)
+  })
+  it.each([
+    "python3 <<'EOF'\n# orgai is the CLI of this project\nprint('orgai docs')\nEOF",
+    "node <<EOF\nconsole.log('run orgai later')\nEOF",
+    "python3 <<'EOF'\nimport os\nprint(os.listdir('.'))\nEOF"
+  ])('still allows a heredoc that only mentions orgai: %j', (command) => {
+    expect(checkSelfControlDenial('Bash', { command }, ctx)).toBeNull()
   })
 })

@@ -23,16 +23,24 @@
  *   then exits 130 / 143; a second signal exits at once.
  * - The in-process host is stopped (force) before the command returns.
  */
-import { readFileSync, statSync } from 'node:fs'
+import { readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
-import { MAX_AUTO_CONTINUES_LIMIT } from '../../shared/defaults'
+import { MAX_AUTO_CONTINUES_LIMIT, projectConnection } from '../../shared/defaults'
 import {
   EXEC_OUTCOME_EXIT_CODE,
   MAX_TIMER_DELAY_MS,
   STAFFING_GOALS,
+  EFFORTS,
+  isEffort,
   isPermissionMode,
   isStaffingGoal,
+  isModelTier,
+  EVOLVE_STRATEGIES,
+  type ConnectionInfo,
+  type ProviderModel,
   type AgentInstance,
+  type EvolvePostRunResult,
+  type EvolveStrategy,
   type ExecOutcome,
   type HeadlessDecisionPolicy,
   type HostScope,
@@ -50,7 +58,7 @@ import { isOpenStatus } from '../../shared/view/runChains'
 import { runIndexMap, runTag } from '../../shared/view/runLabels'
 import { statusText } from '../../shared/view/runStatus'
 import { overridesWidening } from '../../main/runtime/runOverrides'
-import { ensureHost, connectFailure, missingScopesError, type EnsuredHost } from '../client/ensureHost'
+import { EXEC_INPROC, ensureHost, connectFailure, missingScopesError, type EnsuredHost } from '../client/ensureHost'
 import { RunStream, defaultRunStreamTimers, type RunStreamTimers, type SnapshotResult } from '../client/runStream'
 import { TUI_FLAGS, findCommand } from '../commandTable'
 import { parseFlags, type FlagSpec } from '../flags'
@@ -74,8 +82,47 @@ export const MAX_AUTO_DENIALS_LIMIT = 10_000
 const MAX_SECONDS = Math.floor(MAX_TIMER_DELAY_MS / 1000)
 
 /** Swappable in tests: stdin, the reconnect timers and the stop wait. */
+/** A piped stdin that sends nothing for this long, next to a prompt argument, is ignored (an inherited pipe nobody writes to). */
+export const EXEC_STDIN_IDLE_MS = 3000
+
+/**
+ * All of a non-TTY stdin next to a prompt argument: '' when it ends empty or sends no byte within `idleMs`. Unlike the
+ * prompt-on-stdin read it never waits forever for a pipe nobody writes to.
+ */
+function readOptionalStdin(maxBytes: number, idleMs: number): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const s = process.stdin
+    const chunks: Buffer[] = []
+    let size = 0
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (err?: CliError): void => {
+      if (timer) clearTimeout(timer)
+      s.off('data', onData)
+      s.off('end', onEnd)
+      s.off('error', onEnd)
+      s.pause()
+      if (err) reject(err)
+      else resolve(Buffer.concat(chunks).toString('utf8'))
+    }
+    const onData = (c: Buffer | string): void => {
+      if (timer) clearTimeout(timer)
+      timer = undefined
+      const b = Buffer.isBuffer(c) ? c : Buffer.from(String(c))
+      size += b.length
+      if (size > maxBytes) return finish(usage('The input on stdin is larger than 1024 KB.'))
+      chunks.push(b)
+    }
+    const onEnd = (): void => finish()
+    s.on('data', onData)
+    s.on('end', onEnd)
+    s.on('error', onEnd)
+    timer = setTimeout(onEnd, idleMs)
+  })
+}
+
 export const execIo = {
-  readStdin: (maxBytes: number): Promise<string> => readStdinText(maxBytes, 'The prompt on stdin'),
+  readStdin: (maxBytes: number, opts: { idleMs?: number } = {}): Promise<string> =>
+    opts.idleMs !== undefined ? readOptionalStdin(maxBytes, opts.idleMs) : readStdinText(maxBytes, 'The prompt on stdin'),
   timers: defaultRunStreamTimers as RunStreamTimers,
   stopWaitMs: EXEC_STOP_WAIT_MS
 }
@@ -85,7 +132,14 @@ const usage = (message: string): CliError => new CliError(message, EXIT.usage)
 /** A parseFlags spec from a commandTable entry (value flags are strings, the rest booleans). */
 function specOf(command: string): FlagSpec {
   const spec: FlagSpec = {}
-  for (const f of findCommand(command)?.flags ?? []) spec[f.name] = { type: f.takesValue ? 'string' : 'boolean', ...(f.repeatable ? { multiple: true } : {}), ...(f.short ? { short: f.short } : {}) }
+  for (const f of findCommand(command)?.flags ?? []) {
+    spec[f.name] = {
+      type: f.takesValue || f.optionalValue ? 'string' : 'boolean',
+      ...(f.repeatable ? { multiple: true } : {}),
+      ...(f.optionalValue ? { optionalValue: true } : {}),
+      ...(f.short ? { short: f.short } : {})
+    }
+  }
   return spec
 }
 
@@ -203,18 +257,22 @@ export function readPromptFile(ctx: CliContext, file: string): string {
  * The prompt: `text` (a positional or --prompt), else `file` (--prompt-file; '-' reads stdin), '-' reads stdin, none
  * reads a non-TTY stdin. The caller refuses giving both. Empty is exit 2.
  */
-async function readPrompt(ctx: CliContext, text: string | undefined, file: string | undefined, emptyMessage: string): Promise<string> {
+export async function readPrompt(ctx: CliContext, text: string | undefined, file: string | undefined, emptyMessage: string, combineStdin = false): Promise<string> {
   let prompt: string
   if (file !== undefined && file !== '-') prompt = readPromptFile(ctx, file)
   else if (file === '-' || text === '-' || (text === undefined && !ctx.io.stdinIsTTY)) prompt = await execIo.readStdin(EXEC_STDIN_MAX_BYTES)
-  else prompt = text ?? ''
+  else if (combineStdin && text !== undefined && text.trim() && !ctx.io.stdinIsTTY) {
+    // `git diff | orgai exec "review this"`: the argument is the instruction, the piped text its input.
+    const piped = await execIo.readStdin(EXEC_STDIN_MAX_BYTES, { idleMs: EXEC_STDIN_IDLE_MS })
+    prompt = piped.trim() ? `<stdin>\n${piped.replace(/\n$/, '')}\n</stdin>\n\n${text}` : text
+  } else prompt = text ?? ''
   if (Buffer.byteLength(prompt, 'utf8') > EXEC_STDIN_MAX_BYTES) throw usage('The prompt is larger than 1024 KB.')
   if (!prompt.trim()) throw usage(emptyMessage)
   return prompt
 }
 
 /** Starting or continuing a run from inside an OrgAI-managed agent worktree is refused (cli-spec 4.2). */
-function refuseManagedWorktree(managed: { mainCheckout: string } | undefined): void {
+export function refuseManagedWorktree(managed: { mainCheckout: string } | undefined): void {
   if (managed) {
     throw usage(`This folder is an OrgAI agent worktree. Start or continue runs from the main checkout: ${managed.mainCheckout}`)
   }
@@ -224,14 +282,14 @@ export const UNREGISTERED_MESSAGE =
   'This folder is not an OrgAI project. Use --quick for a Chat run in this folder, --create-project to make it a project, or --project <id-or-folder>.'
 
 /** A host RPC failure as a CliError: a refused input is a usage error, anything else exit 1. */
-function hostFailure(e: unknown): CliError {
+export function hostFailure(e: unknown): CliError {
   if (e instanceof CliError) return e
   const data = (e as Partial<HostCallError>)?.data
   const message = e instanceof Error ? e.message : String(e)
   return new CliError(message, data?.code === 'bad_request' ? EXIT.usage : EXIT.failure)
 }
 
-async function call<T>(client: HostClient, method: string, params: unknown[]): Promise<T> {
+export async function call<T>(client: HostClient, method: string, params: unknown[]): Promise<T> {
   try {
     return await client.call<T>(method, params, { timeoutMs: 120_000 })
   } catch (e) {
@@ -240,7 +298,7 @@ async function call<T>(client: HostClient, method: string, params: unknown[]): P
 }
 
 /** The connection a command works through; `needConfigure` reconnects with 'configure' added. */
-class Session {
+export class Session {
   scopes: HostScope[]
   readonly inproc: EnsuredHost['inproc']
   private base: HostClient
@@ -282,6 +340,12 @@ class Session {
     this.checkGranted('configure')
   }
 
+  /** Close the run follower only (the base connection and an in-process host stay up for the next run of a loop). */
+  releaseFollower(): void {
+    this.follower?.close()
+    this.follower = undefined
+  }
+
   async cleanup(): Promise<void> {
     this.follower?.close()
     this.base.close()
@@ -289,9 +353,9 @@ class Session {
   }
 }
 
-async function openSession(ctx: CliContext, configure: boolean): Promise<Session> {
+export async function openSession(ctx: CliContext, configure: boolean): Promise<Session> {
   const scopes: HostScope[] = configure ? ['read', 'operate', 'configure'] : ['read', 'operate']
-  const host = await ensureHost(ctx, scopes, { interactive: false })
+  const host = await ensureHost(ctx, scopes, { interactive: false, inproc: EXEC_INPROC })
   const session = new Session(ctx, host, scopes)
   try {
     if (configure) session.checkGranted('configure')
@@ -317,6 +381,38 @@ export async function noteTeamFiles(ctx: CliContext, client: HostClient, project
   }
 }
 
+/**
+ * `--model` of a project run: a tier name (fast, everyday, deep, top) resolves to the model the project's connection maps
+ * it to (connections:list tierModels); anything else must be a model id of that connection (models:list). Refused here,
+ * before a run exists, with the choices named.
+ */
+export async function resolveModelSelection(client: HostClient, project: Project, raw: string): Promise<{ model: string; connection: string }> {
+  const connection = projectConnection(project)
+  const want = raw.trim()
+  if (isModelTier(want)) {
+    const infos = await call<ConnectionInfo[]>(client, 'connections:list', [])
+    const tierModels = (Array.isArray(infos) ? infos : []).find((i) => i.connection.id === connection)?.connection.tierModels
+    const model = tierModels?.[want]
+    if (!model) throw usage(`--model ${want}: the connection "${safeLine(connection)}" maps no model to the ${want} tier. Use a model id (orgai models list --connection ${safeLine(connection)}).`)
+    return { model, connection }
+  }
+  const models = await call<ProviderModel[]>(client, 'models:list', [{ connection }])
+  const list = Array.isArray(models) ? models : []
+  if (!list.some((m) => m.id === want && m.connection === connection)) {
+    throw usage(`--model ${safeLine(want)}: not a model of the connection "${safeLine(connection)}". Use a tier (fast, everyday, deep, top) or an id from: orgai models list --connection ${safeLine(connection)}`)
+  }
+  return { model: want, connection }
+}
+
+/** `--evolve` (true) or `--evolve=deterministic|hybrid`: what to pass as StartRunInput.evolve, undefined when absent. */
+export function evolveFlag(v: Values): true | EvolveStrategy | undefined {
+  const raw = v.evolve
+  if (raw === undefined || raw === false) return undefined
+  if (raw === true) return true
+  if (typeof raw === 'string' && (EVOLVE_STRATEGIES as readonly string[]).includes(raw)) return raw as EvolveStrategy
+  throw usage(`--evolve takes ${EVOLVE_STRATEGIES.join(' or ')} (attached as --evolve=<strategy>), not "${safeLine(String(raw)).slice(0, 40)}".`)
+}
+
 // ---------- orgai exec ----------
 
 export const runExec: CommandFn = async (ctx: CliContext, args: string[]): Promise<number> => {
@@ -328,11 +424,25 @@ export const runExec: CommandFn = async (ctx: CliContext, args: string[]): Promi
   if (promptFile !== undefined && positionals.length) throw usage('Give the prompt as an argument or with --prompt-file, not both.')
   const quick = v.quick === true
   const create = v['create-project'] === true
+  const modelFlag = str(v, 'model')
+  const effortFlag = str(v, 'effort')
+  const continueRun = v.continue === true
+  if (effortFlag !== undefined && !isEffort(effortFlag)) throw usage(`--effort must be one of ${EFFORTS.join(', ')}.`)
+  if (quick && (modelFlag !== undefined || effortFlag !== undefined)) throw usage('--model and --effort apply to project runs, not --quick runs.')
+  if (continueRun && (quick || create)) throw usage('--continue continues a run of this project; leave out --quick and --create-project.')
+  if (continueRun && (modelFlag !== undefined || effortFlag !== undefined)) throw usage('--model and --effort start a new run with those choices; they cannot change a run that --continue continues.')
+  if (continueRun && str(v, 'team') !== undefined) throw usage('--team applies to a new run; --continue keeps the run\'s own team.')
+  const evolve = evolveFlag(v)
+  if (evolve !== undefined && quick) throw usage('--evolve changes the project\'s team; leave out --quick.')
+  if (evolve !== undefined && continueRun) throw usage('--evolve applies to a new run; leave out --continue.')
+  const quiet = v.quiet === true
+  const lastMessageFile = str(v, 'output-last-message')
+  const runOutput: RunOutput = { quiet, ...(evolve !== undefined ? { evolve: true } : {}), ...(lastMessageFile !== undefined ? { lastMessageFile: resolve(ctx.cwd, lastMessageFile) } : {}) }
   const team = choice(v, 'team') as 'default' | 'single' | undefined
   if (quick && create) throw usage('Use --quick or --create-project, not both.')
   if (v['allow-edits'] === true && !quick) throw usage('--allow-edits applies to --quick runs only.')
   if (quick && ctx.globals.project !== undefined) throw usage('--quick runs in the current folder; leave out --project.')
-  const prompt = await readPrompt(ctx, positionals[0], promptFile, 'Give a prompt: orgai exec "<prompt>", --prompt-file <path>, or - to read it from stdin.')
+  const prompt = await readPrompt(ctx, positionals[0], promptFile, 'Give a prompt: orgai exec "<prompt>", --prompt-file <path>, or - to read it from stdin.', true)
   const images = await loadImages(strs(v, 'image'), ctx.cwd)
 
   // cwd checks before any host is started: an agent worktree, and (while no host runs) an unregistered folder.
@@ -347,8 +457,9 @@ export const runExec: CommandFn = async (ctx: CliContext, args: string[]): Promi
     }
   }
 
-  const session = await openSession(ctx, create)
-  return runAndFollow(ctx, session, async () => {
+  // --evolve needs 'configure': the post-run pass changes the team.
+  const session = await openSession(ctx, create || evolve !== undefined)
+  return runAndFollow(ctx, session, runOutput, async () => {
     if (quick) {
       if (overridesNeedConfigure(undefined, overrides)) await session.needConfigure()
       return call<RunSummary>(session.client, 'runs:startQuick', [
@@ -365,11 +476,32 @@ export const runExec: CommandFn = async (ctx: CliContext, args: string[]): Promi
       project = await call<Project>(session.client, 'projects:create', [
         { name: basename(ctx.cwd) || 'Project', path: ctx.cwd, brief: '', mock: ctx.env.ORGAI_MOCK === '1' }
       ])
-      if (!isJsonOutput(ctx)) printText(ctx, styleFor(ctx).dim(`Created the project ${safeLine(project.name)}.`))
+      if (!isJsonOutput(ctx) && !quiet) printText(ctx, styleFor(ctx).dim(`Created the project ${safeLine(project.name)}.`))
     }
     if (overridesNeedConfigure(project, overrides)) await session.needConfigure()
+    if (continueRun) {
+      const runs = await liveSource(session.client).runs(project.id).catch((e: unknown) => {
+        throw hostFailure(e)
+      })
+      const ended = runs.find((r) => !isOpenStatus(r.status))
+      if (!ended) throw usage('This project has no ended run to continue; start one with: orgai exec "<prompt>"')
+      await noteTeamFiles(ctx, session.client, project.id)
+      return call<RunSummary>(session.client, 'runs:continue', [{ runId: ended.id, text: prompt, ...(images.length ? { images } : {}), overrides, exec: true }])
+    }
+    const selection = modelFlag !== undefined ? await resolveModelSelection(session.client, project, modelFlag) : undefined
     await noteTeamFiles(ctx, session.client, project.id)
-    return call<RunSummary>(session.client, 'runs:start', [{ projectId: project.id, prompt, ...(team === 'single' ? { team: 'single' } : {}), ...(images.length ? { images } : {}), overrides }])
+    return call<RunSummary>(session.client, 'runs:start', [
+      {
+        projectId: project.id,
+        prompt,
+        ...(team === 'single' ? { team: 'single' } : {}),
+        ...(images.length ? { images } : {}),
+        overrides,
+        ...(selection ? { modelSelection: selection } : {}),
+        ...(effortFlag !== undefined ? { effort: effortFlag } : {}),
+        ...(evolve !== undefined ? { evolve } : {})
+      }
+    ])
   })
 }
 
@@ -380,9 +512,10 @@ export const runResume: CommandFn = async (ctx: CliContext, args: string[]): Pro
   const v = values as Values
   // --now / --cancel-auto-resume act on a paused run (resumeActions.ts); they take no prompt and no exec flags.
   if (v.now === true || v['cancel-auto-resume'] === true) return runPausedAction(ctx, v, positionals)
+  if (v.latest === true && positionals.filter((p) => p !== '-').length) throw usage('--latest resumes the newest ended run; leave out the run id.')
   if (v.exec !== true) {
     // Without --exec this is the terminal UI: exec-only flags are a mistake, not something to ignore.
-    const tuiOnly = new Set(['prompt', 'exec', ...TUI_FLAGS.map((f) => f.name)])
+    const tuiOnly = new Set(['prompt', 'exec', 'latest', ...TUI_FLAGS.map((f) => f.name)])
     const execOnly = (findCommand('resume')?.flags ?? []).find((f) => !tuiOnly.has(f.name) && v[f.name] !== undefined)
     if (execOnly) throw usage(`--${execOnly.name} needs --exec (without it, resume opens the terminal UI).`)
     return runResumeTui(ctx, args)
@@ -400,7 +533,7 @@ export const runResume: CommandFn = async (ctx: CliContext, args: string[]): Pro
   if (ctx.globals.project === undefined) refuseManagedWorktree(ctx.resolveProject([]).managedWorktree)
 
   const session = await openSession(ctx, false)
-  return runAndFollow(ctx, session, async () => {
+  return runAndFollow(ctx, session, { quiet: false }, async () => {
     const src = liveSource(session.client)
     let runId: string
     let runs: RunSummary[]
@@ -512,10 +645,52 @@ function cardOf(ev: RunEvent): Partial<PendingCards> | undefined {
  * Start the run (signals already armed), follow its chain until run.finalized and print the result. Always cleans
  * up the session (and an inproc host).
  */
-async function runAndFollow(ctx: CliContext, session: Session, start: () => Promise<RunSummary>): Promise<number> {
+export interface RunOutput {
+  /** Text output: only the final answer on stdout (errors and warnings still on stderr). */
+  quiet: boolean
+  /** Also write the final answer here. */
+  lastMessageFile?: string
+  /**
+   * Team evolution: after the run is finalized, wait for the post-run ratchet pass (org:evolveAfterRun) and report it:
+   * an `evolve` member of the json / stream-json result, one stderr line in text mode. The run must have been started
+   * with `evolve`, on a session that holds 'configure'.
+   */
+  evolve?: boolean
+  /** The caller prints the result itself (a loop): nothing is printed here, and the transcript is not followed in text. */
+  silent?: boolean
+  /** The session (and an in-process host) stays up after the run; the caller cleans it up. Only the follower is closed. */
+  keepSession?: boolean
+  /** Called once with how the run ended (outcome null when it was interrupted or the host went away). */
+  onResult?: (r: ExecRunResult) => void
+}
+
+/** How one followed run ended, for a caller that runs several (`org evolve loop`). */
+export interface ExecRunResult {
+  runId: string | null
+  outcome: ExecOutcome | null
+  exitCode: number
+  summary: RunSummary | null
+  record: RunRecord | null
+  result: string | null
+  evolve: EvolvePostRunResult | null | undefined
+}
+
+/** The one stderr line `exec --evolve` prints in text mode. */
+export function evolveLine(r: EvolvePostRunResult | null | undefined, error?: string): string {
+  if (!r) return error ? `Team evolution: the post-run pass failed (${safeLine(error)}).` : 'Team evolution: no post-run pass ran for this run.'
+  const parts: string[] = [`ratchet ${r.ratchet}${r.ratchetReason ? ` (${safeLine(r.ratchetReason)})` : ''}`]
+  if (r.applied) parts.push(`applied ${safeLine(r.applied.id)} as a trial: ${safeLine(r.applied.summary)}`)
+  else if (r.wasteScore !== undefined) parts.push(`waste score ${r.wasteScore}, no new generation`)
+  return `Team evolution: ${parts.join('; ')}.`
+}
+
+export async function runAndFollow(ctx: CliContext, session: Session, output: RunOutput, start: () => Promise<RunSummary>): Promise<number> {
   const json = isJsonOutput(ctx)
   const stream = ctx.globals.outputFormat === 'stream-json'
   const st = styleFor(ctx)
+  // --quiet changes the text output only; json and stream-json documents are unchanged.
+  const silent = output.silent === true
+  const quiet = (output.quiet || silent) && !json
 
   let finished = false
   /** A run.finalized (or a final snapshot) was seen and printed. */
@@ -594,7 +769,7 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
     printed.add(`${runId}:${e.id}`)
     const s = stateOf(runId)
     if (e.block.kind === 'tool_use') s.toolNames.set(e.block.id, e.block.name)
-    if (json) return
+    if (json || quiet) return
     const line = transcriptLine(e, { st, prefix: st.dim(tagOf(runId)), agentName: (id) => agentLabel(agentOf(runId, id)), toolName: (id) => s.toolNames.get(id) })
     if (line !== null) printText(ctx, line)
   }
@@ -603,11 +778,19 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
     const word = statusWordOfSummary(s.summary)
     if (word === s.word) return
     s.word = word
+    if (quiet) {
+      if (s.summary.status === 'error' && s.summary.error) warn(ctx, safeLine(s.summary.error))
+      return
+    }
     if (!json) printText(ctx, `${st.dim(tagOf(runId))} ${styleStatus(st, word)}${s.summary.status === 'error' && s.summary.error ? ` ${safeLine(s.summary.error)}` : ''}`)
   }
   const printCards = (runId: string, cards: Partial<PendingCards> | undefined): void => {
     if (json || !cards) return
     const s = stateOf(runId)
+    if (quiet) {
+      for (const w of pendingItems({ ...s.summary, status: 'running' }, cards, s.agents)) warn(ctx, `Needs you: ${safeLine(w.label)}`)
+      return
+    }
     for (const w of pendingItems({ ...s.summary, status: 'running' }, cards, s.agents)) {
       printText(ctx, `${st.dim(tagOf(runId))} ${st.yellow('Needs you:')} ${safeLine(w.label)} ${st.dim(`(request ${safeLine(w.key)})`)}`)
     }
@@ -627,10 +810,45 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
       const state = runs.get(summary.id)
       const status = statusText(statusViewOf({ summary, plan: rec?.plan, agents: rec?.agents ?? state?.agents }))
       const result = lastRootText(rec)
-      const doc: Json = { runId: summary.id, execChainId: chainId ?? summary.overrides?.execChainId ?? execChainId ?? summary.id, outcome, exitCode: code, status, summary, result }
-      if (stream) emitLine(ctx, { type: 'result', ...doc })
+      // Team evolution: the pass RunManager started when the run ended (never started here); a failure is reported, not fatal.
+      let evolveResult: EvolvePostRunResult | null | undefined
+      let evolveError: string | undefined
+      if (output.evolve) {
+        try {
+          evolveResult = await session.client.call<EvolvePostRunResult | null>('org:evolveAfterRun', [{ runId: summary.id }], { timeoutMs: 10 * 60_000 })
+        } catch (e) {
+          evolveResult = null
+          evolveError = e instanceof Error ? e.message : String(e)
+        }
+      }
+      const doc: Json = {
+        runId: summary.id,
+        execChainId: chainId ?? summary.overrides?.execChainId ?? execChainId ?? summary.id,
+        outcome,
+        exitCode: code,
+        status,
+        summary,
+        result,
+        ...(output.evolve ? { evolve: (evolveResult ?? { ratchet: 'none', skipped: true, ...(evolveError ? { error: safeLine(evolveError) } : {}) }) as unknown as Json } : {})
+      }
+      output.onResult?.({ runId: summary.id, outcome, exitCode: code, summary, record: rec, result, evolve: evolveResult })
+      if (silent) {
+        // The caller prints.
+      } else if (stream) emitLine(ctx, { type: 'result', ...doc })
       else if (json) emit(ctx, doc, () => [])
-      else printText(ctx, `${st.bold(OUTCOME_LABEL[outcome] ?? safeLine(outcome))} · ${styleStatus(st, status)} · ${costText(summary)}`)
+      else if (quiet) {
+        // Only the answer on stdout; how the run ended is the exit code, and a failure is said on stderr.
+        if (result) printText(ctx, result.replace(/\n+$/, ''))
+        if (outcome !== 'completed' && outcome !== 'completed-unplanned') warn(ctx, `${OUTCOME_LABEL[outcome] ?? safeLine(outcome)} (${EXEC_OUTCOME_EXIT_CODE[outcome] ?? EXIT.failure})`)
+      } else printText(ctx, `${st.bold(OUTCOME_LABEL[outcome] ?? safeLine(outcome))} · ${styleStatus(st, status)} · ${costText(summary)}`)
+      if (output.evolve && !json && !silent) warn(ctx, evolveLine(evolveResult, evolveError))
+      if (output.lastMessageFile) {
+        try {
+          writeFileSync(output.lastMessageFile, result ?? '', 'utf8')
+        } catch (e) {
+          warn(ctx, `Could not write ${safeLine(output.lastMessageFile)}: ${safeLine(e instanceof Error ? e.message : String(e))}`)
+        }
+      }
       resolveExit(code)
     })()
   }
@@ -667,7 +885,7 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
         printEntry(runId, ev.entry)
         return
       case 'plan.updated':
-        if (!json) printText(ctx, `${st.dim(tagOf(runId))} ${planUpdateLine(ev.plan)}`)
+        if (!json && !quiet) printText(ctx, `${st.dim(tagOf(runId))} ${planUpdateLine(ev.plan)}`)
         return
       case 'log':
         printLog(runId, ev.level, ev.message)
@@ -681,7 +899,7 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
       }
       case 'staffing.updated':
         // One line per staffed report, once; json and stream-json carry the raw event instead.
-        if (!json) {
+        if (!json && !quiet) {
           for (const a of ev.staffing.assignments) {
             if (!a.agentId) continue
             const key = `${runId}:${a.agentId}:${a.at}:${a.source}:${a.model}:${a.effort ?? ''}`
@@ -701,16 +919,16 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
     const ev = p.event
     if (typeof p.seq !== 'number' && ev.type === 'agent.partial') {
       adopt(ev.runId)
-      if (stream) emitLine(ctx, { type: 'event', atSeq: p.atSeq, event: eventWithoutImages(ev) })
+      if (stream && !silent) emitLine(ctx, { type: 'event', atSeq: p.atSeq, event: eventWithoutImages(ev) })
       return
     }
-    if (stream) emitLine(ctx, { type: 'event', ...(typeof p.seq === 'number' ? { seq: p.seq } : {}), event: eventWithoutImages(ev) })
+    if (stream && !silent) emitLine(ctx, { type: 'event', ...(typeof p.seq === 'number' ? { seq: p.seq } : {}), event: eventWithoutImages(ev) })
     applyEvent(ev)
   }
 
   const onSnapshot = (res: SnapshotResult, firstTime: boolean): void => {
     const snap = res.snapshot
-    if (stream) {
+    if (stream && !silent) {
       const active = snap.activeRun ? recordWithoutImages(snap.activeRun) : undefined
       emitLine(ctx, { type: 'snapshot', hostInstanceId: res.hostInstanceId, seq: res.seq, filterKey: res.filterKey, snapshot: { ...snap, ...(active ? { activeRun: active } : {}) } })
     }
@@ -794,7 +1012,9 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
         done(EXIT.failure)
       },
       stopped: () => finished,
-      timers: execIo.timers
+      timers: execIo.timers,
+      // A loop reuses the session's connection for its next run: the stream must not close it.
+      ...(output.keepSession ? { keepClient: true } : {})
     })
     // The reconnects replace the client; runs:stop and runs:get go through the current one.
     session.follow(follower)
@@ -817,9 +1037,11 @@ async function runAndFollow(ctx: CliContext, session: Session, start: () => Prom
   const code = await exit
   if (stopTimer) clearTimeout(stopTimer)
   offSignal()
-  await session.cleanup()
+  if (output.keepSession) session.releaseFollower()
+  else await session.cleanup()
   if (code === -1) throw failure instanceof CliError ? failure : hostFailure(failure)
-  if (json && !finalized) {
+  if (!finalized) output.onResult?.({ runId: newest ?? null, outcome: null, exitCode: code, summary: null, record: null, result: null, evolve: undefined })
+  if (json && !finalized && !silent) {
     // Interrupted (or the host went away) before an outcome: still give scripts a final document.
     const doc: Json = { runId: newest ?? null, execChainId: execChainId ?? null, outcome: null, exitCode: code, status: null, summary: null, result: null }
     if (stream) emitLine(ctx, { type: 'result', ...doc })

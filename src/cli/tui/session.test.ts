@@ -5,7 +5,7 @@ import { EXIT, HOST_STARTING_WAIT_MS } from '../types'
 import { connectTuiHost, openTuiSession, TUI_DECIDE_TIMEOUT_MS } from './session'
 
 const P = project('p1', '/work', { name: 'Shop' })
-const SCOPES: HostScope[] = ['read', 'operate', 'decide']
+const SCOPES: HostScope[] = ['read', 'operate', 'decide', 'configure']
 
 function snapshot(seq: number, live: RunSummary[] = [], cards: Record<string, PendingCards> = {}, ended: RunSummary[] = []): RunsSubscribeResult {
   return { mode: 'snapshot', hostInstanceId: 'aaaaaaaaaaaa', seq, filterKey: `fk${seq}`, snapshot: { liveRuns: live, recentEndedRuns: ended, pendingCards: cards } }
@@ -37,7 +37,7 @@ function host(o: { live?: RunSummary[]; list?: RunSummary[]; cards?: Record<stri
       },
       ...o.answers
     },
-    { hello: { grantedScopes: ['read', 'operate', 'decide'], ...o.hello } }
+    { hello: { grantedScopes: [...SCOPES], ...o.hello } }
   )
   return h
 }
@@ -65,26 +65,22 @@ describe('connectTuiHost', () => {
     expect(session.getState().notices).toEqual([])
   })
 
-  it('createProject reconnects with configure, then creates; refuses with exit 1 when not granted', async () => {
-    const h1 = host()
-    const h2 = new FakeHostClient({ 'projects:create': (p) => ({ ...P, name: (p as { name: string }[])[0].name }) }, { hello: { grantedScopes: [...SCOPES, 'configure'] } })
-    const f = fakeContext({ connect: [h1, h2] })
+  it('createProject uses the shared client (it holds configure); refuses with exit 1 when not granted', async () => {
+    const h1 = host({ answers: { 'projects:create': (p) => ({ ...P, name: (p as { name: string }[])[0].name }) } })
+    const f = fakeContext({ connect: [h1] })
     const conn = await connectTuiHost(f.ctx)
     const made = await conn.createProject({ name: 'New', path: '/work' } as never)
     expect(made.name).toBe('New')
-    expect(f.connectCalls[1]).toEqual({ scopes: [...SCOPES, 'configure'], opts: { clientKind: 'tui', waitStartingMs: HOST_STARTING_WAIT_MS } })
-    // The shared client stays open; the configure connection is closed after the call.
+    // No second connection: the one client carries configure.
+    expect(f.connectCalls).toHaveLength(1)
     expect(h1.closed).toBe(false)
-    expect(h2.closed).toBe(true)
-    expect(conn.client).toBe(h1)
-    expect(h2.callsOf('projects:create')).toEqual([[{ name: 'New', path: '/work' }]])
+    expect(h1.callsOf('projects:create')).toEqual([[{ name: 'New', path: '/work' }]])
 
-    const g1 = host()
-    const g2 = new FakeHostClient({ 'projects:create': () => P }, { hello: { grantedScopes: SCOPES } })
-    const g = fakeContext({ connect: [g1, g2] })
+    const g1 = host({ hello: { grantedScopes: ['read', 'operate', 'decide'] }, answers: { 'projects:create': () => P } })
+    const g = fakeContext({ connect: [g1] })
     const c2 = await connectTuiHost(g.ctx)
     await expect(c2.createProject({ name: 'x', path: '/w' } as never)).rejects.toMatchObject({ exitCode: EXIT.failure, message: expect.stringContaining("'configure'") })
-    expect(g2.callsOf('projects:create')).toEqual([])
+    expect(g1.callsOf('projects:create')).toEqual([])
   })
 
   it('startSetup, checkPath; close stops an inproc host only when asked', async () => {
@@ -128,8 +124,8 @@ describe('session switching (onboarding, another project)', () => {
 describe('onboarding with a session open', () => {
   it('createProject leaves the open session and the shared client alone: startSetup and the next session work', async () => {
     const h1 = host({ answers: { 'setup:start': () => summary('s1', { kind: 'setup', projectId: 'p1' }) } })
-    const h2 = new FakeHostClient({ 'projects:create': () => P }, { hello: { grantedScopes: [...SCOPES, 'configure'] } })
-    const f = fakeContext({ connect: [h1, h2] })
+    h1.answers['projects:create'] = () => P
+    const f = fakeContext({ connect: [h1] })
     const conn = await connectTuiHost(f.ctx)
     // Onboarding: a session with no project is open before the App renders.
     const onboarding = await openTuiSession(conn, { folder: '/work' })
