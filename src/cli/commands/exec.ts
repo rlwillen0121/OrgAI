@@ -23,7 +23,7 @@
  *   then exits 130 / 143; a second signal exits at once.
  * - The in-process host is stopped (force) before the command returns.
  */
-import { readFileSync, statSync, writeFileSync } from 'node:fs'
+import { fstatSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
 import { MAX_AUTO_CONTINUES_LIMIT, projectConnection } from '../../shared/defaults'
 import {
@@ -85,11 +85,22 @@ const MAX_SECONDS = Math.floor(MAX_TIMER_DELAY_MS / 1000)
 /** A piped stdin that sends nothing for this long, next to a prompt argument, is ignored (an inherited pipe nobody writes to). */
 export const EXEC_STDIN_IDLE_MS = 3000
 
+/** True when stdin is a regular file (`orgai exec "..." < notes.txt`): it always ends, so it is read whole with no idle limit. */
+function stdinIsRegularFile(): boolean {
+  try {
+    return fstatSync(0).isFile()
+  } catch {
+    return false
+  }
+}
+
 /**
- * All of a non-TTY stdin next to a prompt argument: '' when it ends empty or sends no byte within `idleMs`. Unlike the
- * prompt-on-stdin read it never waits forever for a pipe nobody writes to.
+ * All of a non-TTY stdin next to a prompt argument: '' when it ends empty or sends no byte within `idleMs` (`onIdle` is
+ * then called, so the caller can say the input was left out rather than drop it silently). Unlike the prompt-on-stdin
+ * read it never waits forever for a pipe nobody writes to. The limit covers only the wait for the first byte, and a
+ * regular file has none.
  */
-function readOptionalStdin(maxBytes: number, idleMs: number): Promise<string> {
+function readOptionalStdin(maxBytes: number, idleMs: number, onIdle?: () => void): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const s = process.stdin
     const chunks: Buffer[] = []
@@ -116,13 +127,18 @@ function readOptionalStdin(maxBytes: number, idleMs: number): Promise<string> {
     s.on('data', onData)
     s.on('end', onEnd)
     s.on('error', onEnd)
-    timer = setTimeout(onEnd, idleMs)
+    if (!stdinIsRegularFile()) {
+      timer = setTimeout(() => {
+        onIdle?.()
+        onEnd()
+      }, idleMs)
+    }
   })
 }
 
 export const execIo = {
-  readStdin: (maxBytes: number, opts: { idleMs?: number } = {}): Promise<string> =>
-    opts.idleMs !== undefined ? readOptionalStdin(maxBytes, opts.idleMs) : readStdinText(maxBytes, 'The prompt on stdin'),
+  readStdin: (maxBytes: number, opts: { idleMs?: number; onIdle?: () => void } = {}): Promise<string> =>
+    opts.idleMs !== undefined ? readOptionalStdin(maxBytes, opts.idleMs, opts.onIdle) : readStdinText(maxBytes, 'The prompt on stdin'),
   timers: defaultRunStreamTimers as RunStreamTimers,
   stopWaitMs: EXEC_STOP_WAIT_MS
 }
@@ -263,7 +279,11 @@ export async function readPrompt(ctx: CliContext, text: string | undefined, file
   else if (file === '-' || text === '-' || (text === undefined && !ctx.io.stdinIsTTY)) prompt = await execIo.readStdin(EXEC_STDIN_MAX_BYTES)
   else if (combineStdin && text !== undefined && text.trim() && !ctx.io.stdinIsTTY) {
     // `git diff | orgai exec "review this"`: the argument is the instruction, the piped text its input.
-    const piped = await execIo.readStdin(EXEC_STDIN_MAX_BYTES, { idleMs: EXEC_STDIN_IDLE_MS })
+    const piped = await execIo.readStdin(EXEC_STDIN_MAX_BYTES, {
+      idleMs: EXEC_STDIN_IDLE_MS,
+      onIdle: () =>
+        warn(ctx, `Nothing arrived on stdin within ${EXEC_STDIN_IDLE_MS / 1000} s, so it was left out of the prompt. For a slow producer, write its output to a file first: orgai exec "<prompt>" < file`)
+    })
     prompt = piped.trim() ? `<stdin>\n${piped.replace(/\n$/, '')}\n</stdin>\n\n${text}` : text
   } else prompt = text ?? ''
   if (Buffer.byteLength(prompt, 'utf8') > EXEC_STDIN_MAX_BYTES) throw usage('The prompt is larger than 1024 KB.')

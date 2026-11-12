@@ -265,6 +265,63 @@ describe('openTuiSession', () => {
     expect(session.getState().activeChain).toEqual(['r3'])
   })
 
+  it('staged choices are one-shot: a start that succeeds uses and drops them, a failed start keeps them', async () => {
+    const r3 = summary('r3', { status: 'starting', startedAt: 9 })
+    const r4 = summary('r4', { status: 'starting', startedAt: 12 })
+    let fail = true
+    let n = 0
+    const list: RunSummary[] = []
+    const h = host({
+      list,
+      answers: {
+        'runs:start': () => {
+          if (fail) throw new Error('boom')
+          return n++ === 0 ? r3 : r4
+        }
+      }
+    })
+    const { session } = await open(h, { project: P })
+    list.push(r3, r4)
+    session.stage({ model: { model: 'deep', connection: 'anthropic' }, effort: 'high', permissionMode: 'plan', goal: 'cost' })
+    await expect(session.submitPrompt('one')).rejects.toThrow()
+    expect(session.getStaged()).toMatchObject({ effort: 'high', goal: 'cost' })
+
+    fail = false
+    await session.submitPrompt('one')
+    const first = (h.callsOf('runs:start') as Record<string, unknown>[][]).at(-1)?.[0]
+    expect(first).toMatchObject({ prompt: 'one', modelSelection: { model: 'deep', connection: 'anthropic' }, effort: 'high', permissionMode: 'plan' })
+    expect(JSON.stringify(first)).toContain('"goal":"cost"')
+    expect(session.getStaged()).toEqual({})
+
+    session.setComposeTarget('new')
+    await session.submitPrompt('two')
+    const second = (h.callsOf('runs:start') as Record<string, unknown>[][]).at(-1)?.[0]
+    expect(second).toMatchObject({ prompt: 'two' })
+    expect(second).not.toHaveProperty('modelSelection')
+    expect(second).not.toHaveProperty('effort')
+    expect(second).not.toHaveProperty('permissionMode')
+    expect(JSON.stringify(second)).not.toContain('goal')
+  })
+
+  it('a staged goal rides one continuation, then is dropped; the other staged choices wait for the next start', async () => {
+    const r1 = summary('r1', { status: 'finished', startedAt: 1, sessionId: 'sess' })
+    const r2 = summary('r2', { status: 'finished', startedAt: 5, resumedFrom: 'r1', sessionId: 'sess' })
+    const r3 = summary('r3', { status: 'starting', startedAt: 9, resumedFrom: 'r2', sessionId: 'sess' })
+    const list = [r1]
+    let n = 0
+    const h = host({ list, answers: { 'runs:continue': () => (n++ === 0 ? r2 : r3) } })
+    const { session } = await open(h, { project: P, runId: 'r1' })
+    list.push(r2, r3)
+    session.stage({ goal: 'cost', effort: 'high' })
+    await session.submitPrompt('more')
+    const calls = (): Record<string, unknown>[][] => h.callsOf('runs:continue') as Record<string, unknown>[][]
+    expect(JSON.stringify(calls().at(-1)?.[0])).toContain('"goal":"cost"')
+    expect(session.getStaged()).toEqual({ effort: 'high' })
+    await session.submitPrompt('again')
+    expect(calls()).toHaveLength(2)
+    expect(JSON.stringify(calls().at(-1)?.[0])).not.toContain('goal')
+  })
+
   it('submitPrompt refuses in read-only mode', async () => {
     const { session } = await open(host(), { project: P, readOnlyReason: 'Another window decides here.' })
     await expect(session.submitPrompt('x')).rejects.toThrow('Another window decides here.')

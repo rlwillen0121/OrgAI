@@ -20,8 +20,9 @@ import {
   MAX_PLAN_SKILLS,
   MIN_WASTE_DEFAULT,
   effectiveConcurrency,
+  isFixedRole,
   isPlanEmpty,
-  nextModelFor,
+  tierMoves,
   patchFingerprint,
   planFingerprint,
   stepEffort,
@@ -85,11 +86,6 @@ const addReason = (p: EvolutionRolePatch, r: string): void => {
   p.reason = safeLine(p.reason ? `${p.reason}; ${r}` : r, 240)
 }
 
-/** Whether a tier change on this role changes what it runs on (auto staffing reads the tier; a tier-named model follows it). */
-function tierMoves(project: Project, role: Role): boolean {
-  return effectiveRoleStaffing(role, project).mode === 'auto' || nextModelFor(role, 'fast') !== undefined || nextModelFor(role, 'deep') !== undefined
-}
-
 const roleTierOf = (r: Role): ModelTier | undefined => r.tier ?? tierForModel(r.model) ?? settingTier(r.model)
 
 function fromFindings(project: Project, d: TeamEvolutionDiagnosis): Build {
@@ -106,6 +102,10 @@ function fromFindings(project: Project, d: TeamEvolutionDiagnosis): Build {
       case 'tier_overprovisioned': {
         if (!role || f.exploration) {
           if (f.exploration) b.notes.push(`${f.roleSlug}: thin evidence, a 1-in-${f.exploration.everyK} exploration is suggested (not applied)`)
+          break
+        }
+        if (isFixedRole(project, role)) {
+          b.notes.push(`${role.slug}: over-provisioned but its staffing is fixed, left as configured`)
           break
         }
         const p = patchOf(b, role.slug)
@@ -131,6 +131,10 @@ function fromFindings(project: Project, d: TeamEvolutionDiagnosis): Build {
         if (!role) break
         const tier = roleTierOf(role)
         if (!tier || tier === 'top') break
+        if (isFixedRole(project, role)) {
+          b.notes.push(`${role.slug}: under-provisioned but its staffing is fixed, left as configured`)
+          break
+        }
         const p = patchOf(b, role.slug)
         const floor = role.staffing?.minTier
         const auto = effectiveRoleStaffing(role, project).mode === 'auto'

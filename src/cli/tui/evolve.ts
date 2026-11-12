@@ -170,7 +170,8 @@ export function applyText(r: EvolveApplyResult, strategy: EvolveStrategy): strin
 export function rollbackText(r: EvolveRollbackResult): string {
   if (!r.rolledBack) return `Nothing rolled back: ${cleanLine(r.reason, 200) || 'no reason given'}.`
   const id = r.generation ? ` ${cleanLine(r.generation.id, 20)}` : ''
-  return `Rolled back${id}. ${r.teamFilesSynced ? 'Team files in .orgai/ were synced.' : 'Team files in .orgai/ were not changed.'}`
+  const kept = r.reason ? ` Not everything was restored: ${cleanLine(r.reason, 200)}.` : ''
+  return `Rolled back${id}.${kept} ${r.teamFilesSynced ? 'Team files in .orgai/ were synced.' : 'Team files in .orgai/ were not changed.'}`
 }
 
 export function historyText(h: EvolutionHistory): string {

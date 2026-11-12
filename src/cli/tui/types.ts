@@ -539,7 +539,7 @@ export interface OpenTuiSessionOptions {
   readOnlyReason?: string
 }
 
-/** Per-run choices (/model, /effort, /mode, /goal) held by the session for the next run it starts. */
+/** Per-run choices (/model, /effort, /mode, /goal) held by the session for the next run it starts; dropped once a run used them. */
 export interface StagedRunOptions {
   model?: { model: string; connection: ConnectionId }
   effort?: Effort

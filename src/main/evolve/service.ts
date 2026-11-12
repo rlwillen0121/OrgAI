@@ -230,14 +230,21 @@ export function createEvolveService(deps: EvolveServiceDeps): EvolveService {
   }
 
   async function applyCore(input: EvolveApplyInput): Promise<EvolveApplyResult> {
-    const project = projectOf(input.projectId)
+    let project = projectOf(input.projectId)
     const ledger = ledgerOf(project.id)
     const records = recordsOf(project.id, Math.min(50, Math.max(1, Math.floor(input.runs ?? 10))))
-    const trial = trialOf(ledger)
-    // A trial in flight: report why, with a cheap deterministic plan (never a model call) for display.
-    const { diagnosis, plan } = await planFor(project, input, ledger, trial ? 'deterministic' : (input.strategy ?? 'deterministic'), records)
+    // A trial whose window filled through ordinary runs (none started with evolve) is decided here, so it can never
+    // block a later apply for good and a regression is still rolled back.
+    const open = trialOf(ledger)
+    const settled = open ? await settleTrial(project, ledger, open) : undefined
+    if (settled && settled.state !== 'pending') project = projectOf(input.projectId)
+    const trial = settled?.state === 'pending' ? open : undefined
+    // A trial in flight or just rolled back: report why, with a cheap deterministic plan (never a model call) for display.
+    const hold = trial !== undefined || settled?.state === 'rolled_back'
+    const { diagnosis, plan } = await planFor(project, input, ledger, hold ? 'deterministic' : (input.strategy ?? 'deterministic'), records)
     const refuse = (reason: string): EvolveApplyResult => ({ applied: false, reason, project, diagnosis, plan, teamFilesSynced: false })
-    if (trial) return refuse(`Generation ${trial.id} is still on trial; it needs ${clampWindow(trial.evalWindowRuns)} finished runs before another change.`)
+    if (trial && settled?.state === 'pending') return refuse(`Generation ${trial.id} is still on trial; it has ${settled.have} of ${settled.need} finished runs it needs before another change.`)
+    if (open && settled?.state === 'rolled_back') return refuse(`Generation ${open.id} finished its trial and was rolled back (${settled.reason}); no new change was applied.`)
     if (!plan.gate.ok) return refuse(`The safety gate refused this plan: ${plan.gate.violations.filter((v) => v.action === 'rejected').map((v) => v.rule).join(', ')}.`)
     if (plan.empty) return refuse(diagnosis.wasteScore < (input.minWaste ?? MIN_WASTE_DEFAULT) ? `Waste score ${diagnosis.wasteScore} is below the threshold; nothing to change.` : 'No safe change follows from the findings.')
 
@@ -317,7 +324,7 @@ export function createEvolveService(deps: EvolveServiceDeps): EvolveService {
     return { applied: true, generation: pub(gen), project: after, diagnosis, plan, teamFilesSynced }
   }
 
-  async function rollbackCore(projectId: string, ledger: Ledger, gen: StoredGeneration, reason: string): Promise<{ project: Project; teamFilesSynced: boolean }> {
+  async function rollbackCore(projectId: string, ledger: Ledger, gen: StoredGeneration, reason: string): Promise<{ project: Project; teamFilesSynced: boolean; unusable?: string; notes: string[] }> {
     let notes: string[] = []
     let unusable: string | undefined
     let updated: Project = deps.getProject(projectId) as Project
@@ -365,7 +372,7 @@ export function createEvolveService(deps: EvolveServiceDeps): EvolveService {
     for (const p of Array.isArray(gen.plan?.rolePatches) ? gen.plan.rolePatches : []) addRejected(ledger, { fingerprint: patchFingerprint(p), summary: `${p.slug}: ${p.reason}`, reason, generationId: gen.id, at: now() })
     writeLedger(deps.dataDir, ledger)
     const after = deps.getProject(projectId) ?? updated
-    return { project: after, teamFilesSynced: unusable ? false : await sync(after) }
+    return { project: after, teamFilesSynced: unusable ? false : await sync(after), ...(unusable ? { unusable } : {}), notes }
   }
 
   async function rollbackLocked(input: EvolveRollbackInput): Promise<EvolveRollbackResult> {
@@ -376,7 +383,30 @@ export function createEvolveService(deps: EvolveServiceDeps): EvolveService {
     if (gen.status === 'rolled_back') return { rolledBack: false, reason: `${gen.id} was already rolled back.`, project, teamFilesSynced: false }
     const why = (typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim().slice(0, 200) : 'rolled back by the user')
     const res = await rollbackCore(project.id, ledger, gen, why)
-    return { rolledBack: true, generation: pub(gen), project: res.project, teamFilesSynced: res.teamFilesSynced }
+    // Nothing restored: say so. The generation is closed all the same (rollbackCore), so it cannot wedge the trial.
+    if (res.unusable) return { rolledBack: false, reason: `${gen.id} could not be restored (${res.unusable}); the team was left unchanged and the generation is closed.`.slice(0, 600), generation: pub(gen), project: res.project, teamFilesSynced: false }
+    // Restored in part (a later edit of the user's was kept, a skill could not be put back): the result carries what was not.
+    return { rolledBack: true, ...(res.notes.length ? { reason: res.notes.join('; ').slice(0, 600) } : {}), generation: pub(gen), project: res.project, teamFilesSynced: res.teamFilesSynced }
+  }
+
+  /**
+   * Decide a trial once its window is full: promote it, or roll it back when it regressed. 'pending' while runs are
+   * still missing. Callers hold the project's serial chain.
+   */
+  async function settleTrial(project: Project, ledger: Ledger, trial: StoredGeneration): Promise<{ state: 'pending'; have: number; need: number } | { state: 'promoted' | 'rolled_back'; reason: string }> {
+    const d = evaluateActiveTrial(trial, recordsOf(project.id, 50), effectiveConcurrency(project))
+    if (d.state === 'pending') return { state: 'pending', have: d.have, need: d.need }
+    trial.trialMetrics = d.trialMetrics
+    if (d.regressed) {
+      const res = await rollbackCore(project.id, ledger, trial, `trial regressed: ${d.reason}`)
+      return { state: 'rolled_back', reason: res.unusable ? `${d.reason}; the snapshot was unusable, so the team was left unchanged` : d.reason }
+    }
+    trial.status = 'promoted'
+    trial.decidedAt = now()
+    trial.decidedAtRunCount = measuredRuns(recordsOf(project.id, 50), 50).length
+    trial.outcomeReason = d.reason.slice(0, 600)
+    writeLedger(deps.dataDir, ledger)
+    return { state: 'promoted', reason: d.reason }
   }
 
   async function afterRunLocked(input: EvolveAfterRunInput): Promise<EvolvePostRunResult> {
@@ -386,19 +416,9 @@ export function createEvolveService(deps: EvolveServiceDeps): EvolveService {
     const ledger = ledgerOf(project.id)
     const trial = trialOf(ledger)
     if (trial) {
-      const d = evaluateActiveTrial(trial, recordsOf(project.id, 50), effectiveConcurrency(project))
+      const d = await settleTrial(project, ledger, trial)
       if (d.state === 'pending') return { ...none, ratchet: 'none', ratchetReason: `trial ${trial.id}: ${d.have} of ${d.need} runs` }
-      trial.trialMetrics = d.trialMetrics
-      if (d.regressed) {
-        await rollbackCore(project.id, ledger, trial, `trial regressed: ${d.reason}`)
-        return { ...none, ratchet: 'rolled_back', ratchetReason: d.reason, decided: pub(trial) }
-      }
-      trial.status = 'promoted'
-      trial.decidedAt = now()
-      trial.decidedAtRunCount = measuredRuns(recordsOf(project.id, 50), 50).length
-      trial.outcomeReason = d.reason.slice(0, 600)
-      writeLedger(deps.dataDir, ledger)
-      return { ...none, ratchet: 'promoted', ratchetReason: d.reason, decided: pub(trial) }
+      return { ...none, ratchet: d.state, ratchetReason: d.reason, decided: pub(trial) }
     }
     if (!input.evolve) return { ...none, ratchet: 'none' }
     const records = recordsOf(project.id, 10)

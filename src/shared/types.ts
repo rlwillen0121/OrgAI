@@ -9404,7 +9404,9 @@ export interface EvolveRollbackInput {
 }
 
 export interface EvolveRollbackResult {
+  /** False when nothing was restored (no such generation, already rolled back, or its snapshot was unusable). */
   rolledBack: boolean
+  /** Not rolled back: why. Rolled back: what was not restored (a later edit of the user's that was kept, a skill that could not be put back); absent when the team is exactly as it was. */
   reason?: string
   generation?: EvolutionGeneration
   project: Project

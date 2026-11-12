@@ -34,6 +34,7 @@ import {
   WRITE_EXEC_TOOLS,
   applyPlan,
   effectiveConcurrency,
+  isFixedRole,
   isPlanEmpty,
   isReviewRole,
   isGuardRole,
@@ -43,6 +44,7 @@ import {
   stepEffort,
   stepTier,
   totalPromptChars,
+  tierMoves,
   touchedFields,
   upsertScopeBlock,
   type PatchedField
@@ -175,20 +177,24 @@ export function validateEvolutionPlan(project: Project, plan: EvolutionPlan, opt
     const under = underSlugs.has(slug)
     const cur = currentTier(role)
     const curEffort: Effort = role.effort ?? 'medium'
+    // A role the user fixed runs as configured: its tier, effort and staffing bounds are never an evolution's to change.
+    const fixed = isFixedRole(project, role)
+    if (fixed && (rawPatch.tier !== undefined || rawPatch.effort !== undefined || rawPatch.staffing !== undefined)) trim('staffing_fixed', `${slug} has fixed staffing, so its tier, effort and staffing stay as configured`, slug)
 
-    if (rawPatch.tier !== undefined) {
+    if (!fixed && rawPatch.tier !== undefined) {
       const t = rawPatch.tier
       if (t === 'top') trim('tier_top', `tier "top" is never set by an evolution`, slug)
       else if (!isTier(t)) trim('tier_invalid', `unknown tier`, slug)
       else if (!cur) trim('tier_unknown_base', `${slug} has no known tier to change from`, slug)
       else if (t === cur) {
         // no-op
-      } else if (compareTier(t, cur) > 0) {
+      } else if (!tierMoves(project, role)) trim('tier_no_effect', `${slug} runs on a concrete model, so a tier change would not change what it runs on`, slug)
+      else if (compareTier(t, cur) > 0) {
         if (under && t === stepTier(cur, 1)) out.tier = t
         else trim('tier_raise', `${slug} may be raised only by one step and only when it is under-provisioned`, slug)
       } else out.tier = t
     }
-    if (rawPatch.effort !== undefined) {
+    if (!fixed && rawPatch.effort !== undefined) {
       const e = rawPatch.effort
       if (e === 'xhigh' || e === 'max') trim('effort_xhigh', `effort "${e}" is never set by an evolution`, slug)
       else if (!isEff(e)) trim('effort_invalid', 'unknown effort', slug)
@@ -199,7 +205,7 @@ export function validateEvolutionPlan(project: Project, plan: EvolutionPlan, opt
         else trim('effort_raise', `${slug} may raise effort only by one step and only when under-provisioned`, slug)
       } else out.effort = e
     }
-    if (rawPatch.staffing !== undefined) {
+    if (!fixed && rawPatch.staffing !== undefined) {
       const s = (rawPatch.staffing ?? {}) as Record<string, unknown>
       const curMode = role.staffing?.mode ?? 'auto'
       const next: RoleStaffing = { mode: curMode }

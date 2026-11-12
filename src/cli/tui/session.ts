@@ -558,7 +558,9 @@ export async function openTuiSession(conn: TuiHostConnection, opts: OpenTuiSessi
     ...(firstOpen ? { firstOpen } : {})
   }
 
-  // Choices for the next run this session starts (/model, /effort, /mode, /goal when no run is followed).
+  // Choices for the next run this session starts (/model, /effort, /mode, /goal when no run is followed). One-shot: a
+  // start that succeeded used them all, a continuation used the goal (the only one it carries), so they are dropped
+  // then. A failed call keeps them for the retry.
   let staged: StagedRunOptions = {}
   const mergedOverrides = (over: RunOverrides | undefined): RunOverrides | undefined => {
     const base: RunOverrides = { ...(staged.goal ? { goal: staged.goal } : {}), ...(over ?? {}) }
@@ -622,6 +624,10 @@ export async function openTuiSession(conn: TuiHostConnection, opts: OpenTuiSessi
           const chain = [...state.activeChain]
           const eff = mergedOverrides(o.overrides)
           const next = await startCall<RunSummary>('runs:continue', [{ runId: from, text, ...withOverrides(eff) }], eff, state.project)
+          if (staged.goal) {
+            const { goal: _used, ...rest } = staged
+            staged = rest
+          }
           return adopt(next, chain)
         }
         case 'start': {
@@ -644,6 +650,7 @@ export async function openTuiSession(conn: TuiHostConnection, opts: OpenTuiSessi
             eff,
             state.project
           )
+          staged = {}
           return adopt(next)
         }
         case 'quick':

@@ -70,6 +70,30 @@ describe('validateEvolutionPlan: tiers and effort', () => {
     const unknown = project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: undefined, model: 'some-model-9' })])
     expect(rules(validateEvolutionPlan(unknown, mkPlan({ rolePatches: [patch('dev', { tier: 'fast' })] })))).toContain('tier_unknown_base')
   })
+
+  it('fixed staffing: a patch never changes the tier, effort or staffing of a role the user fixed; its other fields still apply', () => {
+    const roleFixed = project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'deep', model: 'deep', effort: 'high', staffing: { mode: 'fixed' }, tools: ['Read'] })])
+    const out = validateEvolutionPlan(roleFixed, mkPlan({ rolePatches: [patch('dev', { tier: 'everyday', effort: 'medium', staffing: { mode: 'fixed', maxEffort: 'low' }, addTools: ['Grep'] })] }))
+    expect(rules(out)).toContain('staffing_fixed')
+    expect(out.rolePatches).toHaveLength(1)
+    expect(out.rolePatches[0].tier).toBeUndefined()
+    expect(out.rolePatches[0].effort).toBeUndefined()
+    expect(out.rolePatches[0].staffing).toBeUndefined()
+    expect(applyPlan(roleFixed, out).roles[1]).toMatchObject({ tier: 'deep', model: 'deep', effort: 'high', staffing: { mode: 'fixed' } })
+    const projectFixed = project({ staffing: 'fixed' }, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'deep', model: 'deep', effort: 'high' })])
+    const all = validateEvolutionPlan(projectFixed, mkPlan({ rolePatches: [patch('dev', { effort: 'medium' })] }))
+    expect(rules(all)).toContain('staffing_fixed')
+    expect(all.rolePatches).toHaveLength(0)
+    // the same patch on an auto role goes through
+    const auto = project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'deep', model: 'deep', effort: 'high' })])
+    expect(validateEvolutionPlan(auto, mkPlan({ rolePatches: [patch('dev', { effort: 'medium' })] })).rolePatches[0]).toMatchObject({ effort: 'medium' })
+  })
+  it('a tier patch on a role whose concrete model would not follow it is dropped as having no effect', () => {
+    const concrete = project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { model: 'claude-sonnet-4-5', tier: undefined })])
+    const out = validateEvolutionPlan(concrete, mkPlan({ rolePatches: [patch('dev', { tier: 'fast' })] }))
+    expect(out.rolePatches).toHaveLength(0)
+    expect(rules(out).some((r) => r === 'tier_no_effect' || r === 'tier_unknown_base')).toBe(true)
+  })
   it('staffing: floors never above top or the role tier, no mode flips, maxEffort capped', () => {
     const dev = project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'everyday', model: 'everyday', effort: 'medium' })])
     const r = (s: EvolutionRolePatch['staffing']) => validateEvolutionPlan(dev, mkPlan({ rolePatches: [patch('dev', { staffing: s })] }), { diagnosis: under('dev') })

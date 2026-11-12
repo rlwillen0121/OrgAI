@@ -33,7 +33,20 @@ describe('deterministic plan', () => {
     const fixed = project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'deep', model: 'claude-x-9', staffing: { mode: 'fixed' } })])
     const p = deterministicPlan(fixed, diag([over('dev')]), [])
     expect(p.empty).toBe(true)
-    expect(p.rationale).toContain('fixed on a concrete model')
+    expect(p.rationale).toContain('staffing is fixed')
+  })
+
+  it('a role with fixed staffing keeps its effort and tier, whether the role or the whole project is fixed', () => {
+    const roleFixed = project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'deep', model: 'deep', effort: 'high', staffing: { mode: 'fixed' } })])
+    const p = deterministicPlan(roleFixed, diag([over('dev')]), [])
+    expect(p.empty).toBe(true)
+    expect(p.rationale).toContain('dev: over-provisioned but its staffing is fixed')
+    const projectFixed = project({ staffing: 'fixed' }, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'deep', model: 'deep', effort: 'high' })])
+    expect(deterministicPlan(projectFixed, diag([over('dev')]), []).empty).toBe(true)
+    const underFixed = diag([{ kind: 'tier_underprovisioned', roleSlug: 'dev', severity: 30, summary: 's', evidence: [] }])
+    const q = deterministicPlan(project({}, [role('lead', { id: 'r_lead', reportsTo: null }), role('dev', { tier: 'everyday', model: 'everyday', effort: 'low', staffing: { mode: 'fixed' } })]), underFixed, [])
+    expect(q.empty).toBe(true)
+    expect(q.rationale).toContain('under-provisioned but its staffing is fixed')
   })
 
   it('exploration findings are advisory and change nothing', () => {

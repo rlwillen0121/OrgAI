@@ -686,6 +686,19 @@ describe('orgai exec: scripting upgrades', () => {
     expect(seen?.idleMs).toBeGreaterThan(0)
   })
 
+  it('a stdin that stayed silent past the idle wait is left out with a warning, never dropped silently', async () => {
+    execIo.readStdin = async (_max, opts) => {
+      opts?.onIdle?.()
+      return ''
+    }
+    const h = execHost({ answers: completed() })
+    const l = live({ connect: [h] })
+    expect(await runExec(l.ctx, ['hello'])).toBe(EXIT.ok)
+    expect(h.callsOf('runs:start')[0]).toMatchObject([{ prompt: 'hello' }])
+    expect(l.err()).toContain('Nothing arrived on stdin')
+    expect(l.err()).toContain('< file')
+  })
+
   it('--quiet prints only the final answer on stdout; errors still reach stderr; json is unchanged', async () => {
     const h = execHost({ answers: completed() })
     const f = live({ connect: [h] })

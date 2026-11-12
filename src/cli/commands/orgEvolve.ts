@@ -291,7 +291,7 @@ async function evolveRollback(ctx: CliContext, args: string[]): Promise<number> 
     const res = await hostCall<EvolveRollbackResult>(client, EVOLVE_IPC.orgEvolveRollback, [{ projectId: project.id, ...(gen ? { generationId: gen } : {}), reason: 'rolled back from the command line' }])
     emit(ctx, { project: projectJson(project), rolledBack: res.rolledBack, reason: res.reason ?? null, generation: (res.generation ?? null) as unknown as Json, teamFilesSynced: res.teamFilesSynced }, () =>
       res.rolledBack && res.generation
-        ? [`Rolled back ${safeLine(res.generation.id)}: the team is as it was before it.`, res.teamFilesSynced ? 'The .orgai/ team files were updated.' : 'The .orgai/ team files were not written (team files are not active for this project).']
+        ? [res.reason ? `Rolled back ${safeLine(res.generation.id)}, except: ${safeLine(res.reason)}.` : `Rolled back ${safeLine(res.generation.id)}: the team is as it was before it.`, res.teamFilesSynced ? 'The .orgai/ team files were updated.' : 'The .orgai/ team files were not written (team files are not active for this project).']
         : [`Nothing was rolled back${res.reason ? `: ${safeLine(res.reason)}` : '.'}`]
     )
     return res.rolledBack ? EXIT.ok : EXIT.failure
